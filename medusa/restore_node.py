@@ -43,25 +43,24 @@ def restore_node(config, temp_dir, backup_name, in_place, keep_auth, seeds, veri
         logging.error('Cannot keep system_auth when restoring in-place. It would be overwritten')
         sys.exit(1)
 
-    storage = Storage(config=config.storage)
-    capture_release_version(storage, version_target)
+    with Storage(config=config.storage) as storage:
+        capture_release_version(storage, version_target)
 
-    if not use_sstableloader:
-        restore_node_locally(config, temp_dir, backup_name, in_place, keep_auth, seeds, storage,
-                             keyspaces, tables)
-    else:
-        restore_node_sstableloader(config, temp_dir, backup_name, in_place, keep_auth, seeds, storage,
-                                   keyspaces, tables)
+        if not use_sstableloader:
+            restore_node_locally(config, temp_dir, backup_name, in_place, keep_auth, seeds, storage,
+                                 keyspaces, tables)
+        else:
+            restore_node_sstableloader(config, temp_dir, backup_name, in_place, keep_auth, seeds, storage,
+                                       keyspaces, tables)
 
-    if verify:
-        hostname_resolver = HostnameResolver(medusa.config.evaluate_boolean(config.cassandra.resolve_ip_addresses),
-                                             medusa.utils.evaluate_boolean(
-                                                 config.kubernetes.enabled if config.kubernetes else False))
-        verify_restore([hostname_resolver.resolve_fqdn()], config)
+        if verify:
+            hostname_resolver = HostnameResolver(medusa.config.evaluate_boolean(config.cassandra.resolve_ip_addresses),
+                                                 medusa.utils.evaluate_boolean(
+                                                     config.kubernetes.enabled if config.kubernetes else False))
+            verify_restore([hostname_resolver.resolve_fqdn()], config)
 
 
 def restore_node_locally(config, temp_dir, backup_name, in_place, keep_auth, seeds, storage, keyspaces, tables):
-    storage.storage_driver.prepare_download()
     differential_blob = storage.storage_driver.get_blob(
         os.path.join(config.storage.fqdn, backup_name, 'meta', 'differential'))
 
@@ -99,7 +98,10 @@ def restore_node_locally(config, temp_dir, backup_name, in_place, keep_auth, see
     # especially around system tables.
     use_sudo = medusa.utils.evaluate_boolean(config.storage.use_sudo_for_restore)
     clean_path(cassandra.commit_logs_path, use_sudo, keep_folder=True)
-    clean_path(cassandra.saved_caches_path, use_sudo, keep_folder=True)
+
+    if node_backup.is_dse:
+        clean_path(cassandra.dse_metadata_path, use_sudo, keep_folder=True)
+        clean_path(cassandra.dse_search_path, use_sudo, keep_folder=True)
 
     # move backup data to Cassandra data directory according to system table
     logging.info('Moving backup data to Cassandra data directory')
@@ -135,6 +137,12 @@ def restore_node_locally(config, temp_dir, backup_name, in_place, keep_auth, see
             cassandra.start_with_implicit_token()
         else:
             cassandra.start(tokens)
+
+        # if we're restoring DSE, we need to explicitly trigger Search index rebuild
+        if node_backup.is_dse:
+            logging.info('Triggering DSE Search index rebuild')
+            cassandra.rebuild_search_index()
+
     elif not in_place:
         # Kubernetes will manage the lifecycle, but we still need to modify the tokens
         cassandra.replace_tokens_in_cassandra_yaml_and_disable_bootstrap(tokens)
@@ -300,9 +308,15 @@ def maybe_restore_section(section, download_dir, cassandra_data_dir, in_place, k
             logging.info('Keeping section {}.{} untouched'.format(section['keyspace'], section['columnfamily']))
             return
 
-    src = download_dir / section['keyspace'] / section['columnfamily']
-    # not appending the column family name because mv later on copies the whole folder
-    dst = cassandra_data_dir / section['keyspace'] / section['columnfamily']
+    # the 'dse' is an arbitrary name we gave to folders that don't sit in the regular place for keyspaces
+    # this is mostly DSE internal files
+    if section['keyspace'] != 'dse':
+        src = download_dir / section['keyspace'] / section['columnfamily']
+        # not appending the column family name because mv later on copies the whole folder
+        dst = cassandra_data_dir / section['keyspace'] / section['columnfamily']
+    else:
+        src = download_dir / section['keyspace'] / section['columnfamily']
+        dst = cassandra_data_dir.parent / section['columnfamily']
 
     # prepare the destination folder
     if dst.exists():
@@ -369,8 +383,7 @@ def capture_release_version(storage, version_target):
     # Obtain version via CLI, driver or default.
     if version_target:
         HostMan.set_release_version(version_target)
-    elif storage and storage.storage_driver and storage.storage_driver.driver and \
-            storage.storage_driver.driver.api_version:
-        HostMan.set_release_version(storage.storage_driver.driver.api_version)
+    elif storage and storage.storage_driver and storage.storage_driver.api_version:
+        HostMan.set_release_version(storage.storage_driver.api_version)
     else:
         HostMan.set_release_version(HostMan.DEFAULT_RELEASE_VERSION)

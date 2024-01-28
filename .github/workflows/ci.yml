@@ -13,21 +13,21 @@ jobs:
   build:
     strategy:
       matrix:
-        python-version: [3.6, 3.7, 3.8, 3.9, "3.10"]
+        python-version: [3.7, 3.8, 3.9, "3.10", "3.11"]
         include:
           - python-version: 3.7
             tox-py: py37
-          - python-version: 3.6
-            tox-py: py36
           - python-version: 3.8
             tox-py: py38
           - python-version: 3.9
             tox-py: py39
           - python-version: "3.10"
             tox-py: py310
+          - python-version: "3.11"
+            tox-py: py311
     runs-on: ubuntu-20.04
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v1
       with:
@@ -68,7 +68,7 @@ jobs:
       fail-fast: false
     runs-on: ${{ matrix.os-version }}
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Build Debian Package
       run: |
         version=$(cat VERSION)
@@ -105,48 +105,59 @@ jobs:
     strategy:
         fail-fast: false
         matrix:
-          #python-version: [3.6]
-          python-version: [3.6, "3.10"]
-          it-backend: [local, s3, gcs, minio, azure]
+          python-version: [3.7, 3.8, 3.9, "3.10", "3.11"]
+          it-backend: [local, s3, gcs, minio, azure, azure-hierarchical]
           # IBM not included by default due to lite plan quota being easily exceeded
           #it-backend: [local, s3, gcs, minio, ibm, azure]
           cassandra-version: [2.2.19, 3.11.11, 4.0.0, 'github:apache/trunk']
           include:
+            # tweak the experimental flag for cassandra versions
             - cassandra-version: 2.2.19
               experimental: false
             - cassandra-version: 3.11.11
               experimental: false
             - cassandra-version: 4.0.0
               experimental: false
-            - cassandra-version: 'github:apache/trunk'
-              experimental: true
+            # explicitly include tests against python 3.11 and one version of cassandra
+            - python-version: "3.11"
+              cassandra-version: 4.0.0
+              it-backend: gcs
+              experimental: false
+            # explicitly include tests against python 3.10 and one version of cassandra
+            - python-version: "3.10"
+              cassandra-version: 4.0.0
+              it-backend: gcs
+              experimental: false
+            # explicitly include tests against python 3.8 and one version of cassandra
+            - python-version: 3.8
+              cassandra-version: 4.0.0
+              it-backend: gcs
+              experimental: false
+            # explicitly include tests against python 3.7 and one version of cassandra
+            - python-version: 3.7
+              cassandra-version: 4.0.0
+              it-backend: gcs
+              experimental: false
           exclude:
-            # excludes unnecessary combinations
+            # no tests against trunk
+            - cassandra-version: 'github:apache/trunk'
+            # fewer tests against cassandra 3.11.11 (exclude all but local storage backends)
             - it-backend: s3
-              cassandra-version: 2.2.19
-            - it-backend: s3
-              cassandra-version: 'github:apache/trunk'
-            - it-backend: s3
-              python-version: "3.10"
+              cassandra-version: "3.11.11"
             - it-backend: gcs
-              cassandra-version: 2.2.19
-            - it-backend: gcs
-              cassandra-version: 'github:apache/trunk'
-            - it-backend: gcs
-              python-version: "3.10"
+              cassandra-version: "3.11.11"
             - it-backend: minio
-              cassandra-version: 2.2.19
-            - it-backend: minio
-              cassandra-version: 'github:apache/trunk'
-            - it-backend: minio
-              python-version: "3.10"
+              cassandra-version: "3.11.11"
             - it-backend: azure
-              cassandra-version: 2.2.19
-            - it-backend: azure
-              cassandra-version: 'github:apache/trunk'
-            - it-backend: azure
-              python-version: "3.10"
-            
+              cassandra-version: "3.11.11"
+            - it-backend: azure-hierarchical
+              cassandra-version: "3.11.11"
+            # no tests against non-python3.9, except the explicitly allowed combinations
+            - python-version: 3.7
+            - python-version: 3.8
+            - python-version: "3.10"
+            - python-version: "3.11"
+
     runs-on: ubuntu-20.04
     services:
       minio:
@@ -160,7 +171,7 @@ jobs:
           - ${{ github.workspace }}/../data:/data
         options: --name=minio --health-cmd "curl http://localhost:9000/minio/health/live"
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v1
       with:
@@ -180,11 +191,11 @@ jobs:
         pip install -r requirements-test.txt
         pip install ccm
         case '${{ matrix.it-backend }}' in
-          'azure')
-            pip install -r requirements-azure.txt
+          'azure'|'azure-hierarchical')
+            echo "No extra requirements for now."
             ;;
           'ibm'|'minio'|'s3')
-            pip install -r requirements-s3.txt
+            echo "No extra requirements for now."
             ;;
         esac
 
@@ -198,7 +209,8 @@ jobs:
           || ( "${{ matrix.it-backend }}" == "minio" ) \
           || ( -n '${{ secrets.MEDUSA_GCS_CREDENTIALS }}' && "${{ matrix.it-backend }}" == "gcs" ) \
           || ( -n '${{ secrets.MEDUSA_IBM_CREDENTIALS }}' && "${{ matrix.it-backend }}" == "ibm" ) \
-          || ( -n '${{ secrets.MEDUSA_AZURE_CREDENTIALS }}' && "${{ matrix.it-backend }}" == "azure" ) ]];
+          || ( -n '${{ secrets.MEDUSA_AZURE_CREDENTIALS }}' && "${{ matrix.it-backend }}" == "azure" ) \
+          || ( -n '${{ secrets.MEDUSA_AZURE_HIERARCHICAL_CREDENTIALS }}' && "${{ matrix.it-backend }}" == "azure-hierarchical" ) ]];
         then
           echo "IT_CAN_RUN=yes" >> $GITHUB_ENV
         else
@@ -233,6 +245,19 @@ jobs:
         ccm start -v
         ccm showlastlog|tail -100
         ccm stop
+        # if we are dealing with C* 4.0+, we need to fix the java-driver dependency.
+        # it has a bug that breaks sstableloader tests with client encryption enabled
+        # if cassandra version starts with 4.0 or 4.1
+        if [[ "${{ matrix.cassandra-version }}" =~ ^4\.[01]\. ]];
+        then
+          ccm create driver-fix-cluster -v ${{ matrix.cassandra-version }} -n 1
+          # enclosed in () so we return to current pwd once we are done fixing the driver
+          (
+            cd ~/.ccm/repository/${{ matrix.cassandra-version }}/lib
+            rm cassandra-driver-core-3.11.0-shaded.jar
+            wget https://repo1.maven.org/maven2/com/datastax/cassandra/cassandra-driver-core/3.11.5/cassandra-driver-core-3.11.5-shaded.jar
+          )
+        fi
         if [ "${{ matrix.it-backend }}" == "s3" ]
         then
           # AWS S3 Storage tests
@@ -263,6 +288,11 @@ jobs:
           # Azure Blob Storage tests
           printf "%s" '${{ secrets.MEDUSA_AZURE_CREDENTIALS }}' > ~/medusa_azure_credentials.json
           ./run_integration_tests.sh -v --azure --no-local --cassandra-version=${{ matrix.cassandra-version }} 
+        elif [ "${{ matrix.it-backend }}" == "azure-hierarchical" ]
+        then
+          # Azure Blob Storage with hierarchical namespace tests
+          printf "%s" '${{ secrets.MEDUSA_AZURE_HIERARCHICAL_CREDENTIALS }}' > ~/medusa_azure_credentials.json
+          ./run_integration_tests.sh -v --azure --no-local --cassandra-version=${{ matrix.cassandra-version }} 
         else
         # Local storage tests
           ./run_integration_tests.sh -v --cassandra-version=${{ matrix.cassandra-version }}
@@ -274,35 +304,147 @@ jobs:
 
     - uses: codecov/codecov-action@v1
       name: Report code coverage
-  
 
-  publish-docker-master:
-    needs: [debian-build, build, integration-tests]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+  k8ssandra-e2e-tests:
+    needs: [build]
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        storage-provider: ["", "-s3", "-azure", "-gcs"]
+        e2e_test:
+          - CreateSingleMedusaJob
+          - CreateSingleDseSearchDatacenterCluster
+      fail-fast: false
+    name: k8ssandra-${{ matrix.e2e_test }}
+    env:
+      CGO_ENABLED: 0
+      KUBECONFIG_FILE: "./build/kind-kubeconfig"
+      CONTROL_PLANE: kind-k8ssandra-0
+      DATA_PLANES: kind-k8ssandra-0
+    steps:
+      - name: Raise open files limit
+        run: |
+          echo fs.file-max=1000000 | sudo tee -a /etc/sysctl.conf && sudo sysctl -p
+          echo fs.inotify.max_user_instances=1280 | sudo tee -a /etc/sysctl.conf && sudo sysctl -p
+          echo fs.inotify.max_user_watches=655360 | sudo tee -a /etc/sysctl.conf && sudo sysctl -p
+          ulimit -a
+      - name: Free diskspace by removing unused packages
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      - name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.K8SSANDRA_DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.K8SSANDRA_DOCKER_HUB_PASSWORD }}
+      - uses: actions/checkout@v3
+        with:
+          path: cassandra-medusa
+      - uses: actions/checkout@v3
+        with:
+          repository: k8ssandra/k8ssandra-operator
+          ref: radovan/ec2-dse-medusa
+          path: k8ssandra-operator
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: '1.20'
+          cache: true
+          cache-dependency-path: "**/*.sum"
+      - name: Install Kind
+        working-directory: k8ssandra-operator
+        run: go get sigs.k8s.io/kind
+      - name: Install kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: 4.x
+      - name: Build Medusa
+        working-directory: cassandra-medusa
+        run: |
+          echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          python setup.py build
+      - name: Build Medusa image
+        id: docker_build
+        uses: docker/build-push-action@v4
+        with:
+          file: cassandra-medusa/k8s/Dockerfile
+          context: ./cassandra-medusa
+          tags: k8ssandra/medusa:${{ env.short_sha }}-tmp
+          platforms: linux/amd64
+          push: true
+      - name: Setup kind cluster
+        working-directory: k8ssandra-operator
+        run: |
+          make single-up
+      - name: Run e2e test ( ${{ matrix.e2e_test }} )
+        working-directory: k8ssandra-operator
+        run: |
+          e2e_test="TestOperator/${{ matrix.e2e_test }}"
+          args="-kubeconfigFile '${{ env.KUBECONFIG_FILE }}'"
+          args="$args -controlPlane '${{ env.CONTROL_PLANE }}'"
+          args="$args -dataPlanes '${{ env.DATA_PLANES }}'"
+          args="$args -medusaImageTag ${{ env.short_sha }}-tmp"
+          make E2E_TEST="$e2e_test" TEST_ARGS="$args" e2e-test
+      - name: Setup tmate session
+        if: ${{ failure() }}
+        uses: mxschmitt/action-tmate@v3
+        timeout-minutes: 15
+      - name: Get artefact upload directory
+        working-directory: k8ssandra-operator
+        if: ${{ failure() }}
+        run: |
+          uploaddir_name=$(echo ${{ matrix.e2e_test }}| sed 's/\//__/g')
+          echo 'setting uploaddir_name to' $uploaddir_name
+          echo "uploaddir_name=$uploaddir_name" >> $GITHUB_ENV
+      - name: Archive k8s logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: k8s-logs-${{ env.uploaddir_name }}
+          path: ./k8ssandra-operator/build/test
+
+  publish-docker-master:
+    needs: [debian-build, build, integration-tests, k8ssandra-e2e-tests]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-20.04
     steps:
-    - uses: actions/checkout@v2
-    - name: Publish Beta Docker Image
-      env:
-        DOCKER_USERNAME: ${{ secrets.K8SSANDRA_DOCKER_HUB_USERNAME }}
-        DOCKER_TOKEN: ${{ secrets.K8SSANDRA_DOCKER_HUB_PASSWORD }}
+    - uses: actions/checkout@v3
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v2
+      with:
+        platforms: 'arm64,arm'
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    - name: Login to DockerHub
+      uses: docker/login-action@v2
+      with:
+        username: ${{ secrets.K8SSANDRA_DOCKER_HUB_USERNAME }}
+        password: ${{ secrets.K8SSANDRA_DOCKER_HUB_PASSWORD }}
+    - name: Set git parsed values
+      id: vars
+      shell: bash
       run: |
-        docker login -u $DOCKER_USERNAME -p $DOCKER_TOKEN
-        echo "Publishing release $(git rev-parse --short HEAD)${{ matrix.storage-provider }} in Docker Hub"
+        echo "sha_short=$(git rev-parse --short=8 ${{ github.sha }})" >> $GITHUB_OUTPUT
+    - name: Build Medusa
+      run: |
+        echo "Publishing release $(git rev-parse --short HEAD) in Docker Hub"
         python setup.py build
-        # Push Docker image tagged with the short commit sha
-        docker build -t k8ssandra/medusa:$(git rev-parse --short HEAD)${{ matrix.storage-provider }} -f k8s/Dockerfile${{ matrix.storage-provider }} .
-        docker push k8ssandra/medusa:$(git rev-parse --short HEAD)${{ matrix.storage-provider }}
-        # Push Docker image tagged as "master"
-        docker tag k8ssandra/medusa:$(git rev-parse --short HEAD)${{ matrix.storage-provider }} k8ssandra/medusa:master${{ matrix.storage-provider }}
-        docker push k8ssandra/medusa:master${{ matrix.storage-provider }}
+    - name: Build image and push
+      id: docker_build
+      uses: docker/build-push-action@v4
+      with:
+        file: k8s/Dockerfile
+        context: .
+        push: true
+        tags: k8ssandra/medusa:${{ steps.vars.outputs.sha_short}},k8ssandra/medusa:master
+        platforms: linux/amd64,linux/arm64
+        cache-from: type=local,src=/tmp/.buildx-cache
+        cache-to: type=local,dest=/tmp/.buildx-cache
     
   publish-debian:
     # We can only release if the build above succeeded first
-    needs: [debian-build, build, integration-tests]
+    needs: [debian-build, build, integration-tests, k8ssandra-e2e-tests]
     if: github.event_name == 'release' && github.event.action == 'published'
     strategy:
       matrix:
@@ -313,7 +455,7 @@ jobs:
       fail-fast: false
     runs-on: ${{ matrix.os-version }}
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Install dependencies
       run: |
         sudo curl -L "https://github.com/docker/compose/releases/download/1.25.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
@@ -344,23 +486,40 @@ jobs:
   publish-docker:
     needs: [publish-debian]
     if: github.event_name == 'release' && github.event.action == 'published'
-    strategy:
-      matrix:
-        storage-provider: ["", "-s3", "-azure", "-gcs"]
     runs-on: ubuntu-20.04
     steps:
-    - uses: actions/checkout@v2
-    - name: Publish Docker Image
-      env:
-        DOCKER_USERNAME: ${{ secrets.K8SSANDRA_DOCKER_HUB_USERNAME }}
-        DOCKER_TOKEN: ${{ secrets.K8SSANDRA_DOCKER_HUB_PASSWORD }}
+    - uses: actions/checkout@v3
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v2
+      with:
+        platforms: 'arm64,arm'
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v1
+    - name: Login to DockerHub
+      uses: docker/login-action@v2
+      with:
+        username: ${{ secrets.K8SSANDRA_DOCKER_HUB_USERNAME }}
+        password: ${{ secrets.K8SSANDRA_DOCKER_HUB_PASSWORD }}
+    - name: Set git parsed values
+      id: vars
+      shell: bash
       run: |
-        version=$(cat VERSION)
-        docker login -u $DOCKER_USERNAME -p $DOCKER_TOKEN
-        echo "Publishing release ${version} in Docker Hub"
+        echo "version=$(cat VERSION)" >> $GITHUB_OUTPUT
+    - name: Build Medusa
+      run: |
+        echo "Publishing release ${{ steps.vars.outputs.version}} in Docker Hub"
         python setup.py build
-        docker build -t k8ssandra/medusa:${version}${{ matrix.storage-provider }} -f k8s/Dockerfile${{ matrix.storage-provider }} .
-        docker push k8ssandra/medusa:${version}${{ matrix.storage-provider }}
+    - name: Build image and push
+      id: docker_build
+      uses: docker/build-push-action@v4
+      with:
+        file: k8s/Dockerfile
+        context: .
+        push: true
+        tags: k8ssandra/medusa:${{ steps.vars.outputs.version}}
+        platforms: linux/amd64,linux/arm64
+        cache-from: type=local,src=/tmp/.buildx-cache
+        cache-to: type=local,dest=/tmp/.buildx-cache
 
   publish-pypi:
     # We can only release if the build above succeeded first
@@ -368,11 +527,11 @@ jobs:
     if: github.event_name == 'release' && github.event.action == 'published'
     runs-on: ubuntu-20.04
     steps:
-    - uses: actions/checkout@v2
-    - name: Set up Python 3.6
+    - uses: actions/checkout@v3
+    - name: Set up Python 3.7
       uses: actions/setup-python@v1
       with:
-        python-version: 3.6
+        python-version: 3.7
     - name: Install dependencies
       run: |
         python -m venv venv

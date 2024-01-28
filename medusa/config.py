@@ -30,17 +30,17 @@ StorageConfig = collections.namedtuple(
     'StorageConfig',
     ['bucket_name', 'key_file', 'prefix', 'fqdn', 'host_file_separator', 'storage_provider',
      'base_path', 'max_backup_age', 'max_backup_count', 'api_profile', 'transfer_max_bandwidth',
-     'concurrent_transfers', 'multi_part_upload_threshold', 'host', 'region', 'port', 'secure', 'aws_cli_path',
-     'kms_id', 'backup_grace_period_in_days', 'use_sudo_for_restore', 'k8s_mode']
+     'concurrent_transfers', 'multi_part_upload_threshold', 'host', 'region', 'port', 'secure', 'ssl_verify',
+     'aws_cli_path', 'kms_id', 'backup_grace_period_in_days', 'use_sudo_for_restore', 'k8s_mode']
 )
 
 CassandraConfig = collections.namedtuple(
     'CassandraConfig',
     ['start_cmd', 'stop_cmd', 'config_file', 'cql_username', 'cql_password', 'check_running', 'is_ccm',
      'sstableloader_bin', 'nodetool_username', 'nodetool_password', 'nodetool_password_file_path', 'nodetool_host',
-     'nodetool_port', 'certfile', 'usercert', 'userkey', 'sstableloader_ts', 'sstableloader_tspw',
-     'sstableloader_ks', 'sstableloader_kspw', 'nodetool_ssl', 'resolve_ip_addresses', 'use_sudo', 'nodetool_flags',
-     'cql_k8s_secrets_path', 'nodetool_k8s_secrets_path']
+     'nodetool_executable', 'nodetool_port', 'certfile', 'usercert', 'userkey', 'sstableloader_ts',
+     'sstableloader_tspw', 'sstableloader_ks', 'sstableloader_kspw', 'nodetool_ssl', 'resolve_ip_addresses', 'use_sudo',
+     'nodetool_flags', 'cql_k8s_secrets_path', 'nodetool_k8s_secrets_path']
 )
 
 SSHConfig = collections.namedtuple(
@@ -73,7 +73,7 @@ LoggingConfig = collections.namedtuple(
 
 GrpcConfig = collections.namedtuple(
     'GrpcConfig',
-    ['enabled']
+    ['enabled', 'max_send_message_length', 'max_receive_message_length']
 )
 
 KubernetesConfig = collections.namedtuple(
@@ -109,8 +109,9 @@ def _build_default_config():
         'api_profile': '',
         'transfer_max_bandwidth': '50MB/s',
         'concurrent_transfers': '1',
-        'multi_part_upload_threshold': str(100 * 1024 * 1024),
+        'multi_part_upload_threshold': str(20 * 1024 * 1024),
         'secure': 'True',
+        'ssl_verify': 'False',      # False until we work out how to specify custom certs
         'aws_cli_path': 'aws',
         'fqdn': socket.getfqdn(),
         'region': 'default',
@@ -136,6 +137,7 @@ def _build_default_config():
         'sstableloader_bin': 'sstableloader',
         'resolve_ip_addresses': 'True',
         'use_sudo': 'True',
+        'nodetool_executable': 'nodetool',
         'nodetool_flags': '-Dcom.sun.jndi.rmiURLParsing=legacy'
     }
 
@@ -161,6 +163,8 @@ def _build_default_config():
 
     config['grpc'] = {
         'enabled': 'False',
+        'max_send_message_length': '536870912',
+        'max_receive_message_length': '134217728',
     }
 
     config['kubernetes'] = {
@@ -202,6 +206,15 @@ def parse_config(args, config_file):
             for key, value in _zip_fields_with_arg_values(settings, args)
             if value is not None
         }})
+
+    # the k8s mode and grpc server overlap in a keyword 'enabled'
+    # so we need to reconcile them explicitly
+    k8s_enabled = evaluate_boolean(config['kubernetes']['enabled'])
+    if args.get('k8s_enabled', 'False') == 'True' or k8s_enabled:
+        config.set('kubernetes', 'enabled', 'True')
+    grpc_enabled = evaluate_boolean(config['grpc']['enabled'])
+    if args.get('grpc_enabled', "False") == 'True' or grpc_enabled:
+        config.set('grpc', 'enabled', 'True')
 
     if evaluate_boolean(config['kubernetes']['enabled']):
         if evaluate_boolean(config['cassandra']['use_sudo']):
@@ -323,6 +336,12 @@ def load_config(args, config_file):
     for field in ['username', 'key_file']:
         if getattr(medusa_config.ssh, field) is None:
             logging.error('Required configuration "{}" is missing in [ssh] section.'.format(field))
+            sys.exit(2)
+
+    for field in ['bucket_name', 'prefix']:
+        value = getattr(medusa_config.storage, field)
+        if value is not None and '/' in value:
+            logging.error('Required configuration "{}" cannot contain a slash ("/")'.format(field))
             sys.exit(2)
 
     return medusa_config

@@ -15,22 +15,25 @@
 
 import base64
 import configparser
-import datetime
 import hashlib
 import os
 import shutil
 import tempfile
 import unittest
 
+from datetime import datetime
+from random import randrange
+
 import medusa.storage.abstract_storage
 
-from medusa.storage.abstract_storage import AbstractStorage
+from medusa.storage import NodeBackup, ClusterBackup
+from medusa.storage.abstract_storage import AbstractStorage, AbstractBlob
 from medusa.config import MedusaConfig, StorageConfig, _namedtuple_from_dict, CassandraConfig
 from medusa.index import build_indices
 from medusa.storage import Storage
 
 
-class RestoreNodeTest(unittest.TestCase):
+class StorageTest(unittest.TestCase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.local_storage_dir = "/tmp/medusa_local_storage"
@@ -52,7 +55,8 @@ class RestoreNodeTest(unittest.TestCase):
             'fqdn': '127.0.0.1',
             'api_key_or_username': '',
             'api_secret_or_password': '',
-            'base_path': '/tmp'
+            'base_path': '/tmp',
+            'concurrent_transfers': 1,
         }
         config['cassandra'] = {
             'is_ccm': 1
@@ -92,8 +96,10 @@ class RestoreNodeTest(unittest.TestCase):
     def test_list_objects(self):
         file1_content = "content of the test file1"
         file2_content = "content of the test file2"
+        file3_content = ""
         self.storage.storage_driver.upload_blob_from_string("test_download_blobs1/file1.txt", file1_content)
         self.storage.storage_driver.upload_blob_from_string("test_download_blobs2/file2.txt", file2_content)
+        self.storage.storage_driver.upload_blob_from_string("test_download_blobs3/file3.txt", file3_content)
         objects = self.storage.storage_driver.list_objects()
         self.assertEqual(len(objects), 2)
         one_object = self.storage.storage_driver.list_objects("test_download_blobs2")
@@ -184,7 +190,7 @@ class RestoreNodeTest(unittest.TestCase):
         self.storage.storage_driver.upload_blob_from_string("test_download_blobs1/file1.txt", file1_content)
         obj = self.storage.storage_driver.get_blob("test_download_blobs1/file1.txt")
         self.assertEqual(
-            datetime.datetime.fromtimestamp(int(obj.extra["modify_time"])),
+            obj.last_modified,
             self.storage.storage_driver.get_object_datetime(obj)
         )
 
@@ -284,6 +290,34 @@ class RestoreNodeTest(unittest.TestCase):
         self.assertTrue("node1" in blobs_by_backup["backup2"])
         self.assertFalse("node2" in blobs_by_backup["backup2"])
 
+    def test_parse_backup_index_with_wrong_names(self):
+        file_content = "content of the test file"
+        prefix_path = self.storage.prefix_path
+
+        # Index files for a backup
+        self.storage.storage_driver.upload_blob_from_string(
+            "{}index/backup_index/backup3/tokenmap_node1.json".format(prefix_path), file_content)
+        self.storage.storage_driver.upload_blob_from_string(
+            "{}index/backup_index/backup3/schema_node1.cql".format(prefix_path), file_content)
+        self.storage.storage_driver.upload_blob_from_string(
+            "{}index/backup_index/backup3/started_node1_1689598370.timestamp".format(prefix_path), file_content)
+        self.storage.storage_driver.upload_blob_from_string(
+            "{}index/backup_index/backup3/finished_node1_1689598370.timestamp".format(prefix_path), file_content)
+        # Files that we want to see filtered out
+        self.storage.storage_driver.upload_blob_from_string(
+            "{}index/backup_index/extra_folder/backup3/tokenmap_node2.json".format(prefix_path), file_content)
+        self.storage.storage_driver.upload_blob_from_string(
+            "{}index/missing_folder/tokenmap_node2.json".format(prefix_path), file_content)
+        self.storage.storage_driver.upload_blob_from_string(
+            "{}index/backup_index/missing_file".format(prefix_path), file_content)
+
+        path = '{}index/backup_index'.format(prefix_path)
+        backup_index = self.storage.storage_driver.list_objects(path)
+        blobs_by_backup = self.storage.group_backup_index_by_backup_and_node(backup_index)
+        self.assertEqual(1, len(blobs_by_backup.keys()))
+        self.assertEqual(1, len(blobs_by_backup['backup3'].keys()))
+        self.assertEqual(4, len(blobs_by_backup['backup3']['node1']))
+
     def test_remove_extension(self):
         self.assertEqual(
             'localhost',
@@ -320,6 +354,33 @@ class RestoreNodeTest(unittest.TestCase):
             1574343029,
             self.storage.get_timestamp_from_blob_name('index/bi/third_backup/finished_localhost_1574343029.timestamp')
         )
+
+
+def make_node_backup(storage, name, backup_date, differential=False, fqdn="localhost"):
+    if differential is True:
+        differential_blob = make_blob("localhost/{}/meta/differential".format(name), backup_date.timestamp())
+    else:
+        differential_blob = None
+    tokenmap_blob = make_blob("localhost/{}/meta/tokenmap.json".format(name), backup_date.timestamp())
+    schema_blob = make_blob("localhost/{}/meta/schema.cql".format(name), backup_date.timestamp())
+    manifest_blob = make_blob("localhost/{}/meta/manifest.json".format(name), backup_date.timestamp())
+    return NodeBackup(storage=storage, fqdn=fqdn, name=str(name),
+                      differential_blob=differential_blob, manifest_blob=manifest_blob,
+                      tokenmap_blob=tokenmap_blob, schema_blob=schema_blob,
+                      started_timestamp=backup_date.timestamp(), finished_timestamp=backup_date.timestamp())
+
+
+def make_cluster_backup(storage, name, backup_date, nodes, differential=False):
+    node_backups = list()
+    for node in nodes:
+        node_backups.append(make_node_backup(storage, name, backup_date, differential, node))
+    return ClusterBackup(name, node_backups)
+
+
+def make_blob(blob_name, blob_date):
+    checksum = hashlib.md5()
+    checksum.update(os.urandom(4))
+    return AbstractBlob(blob_name, randrange(100), checksum.hexdigest(), datetime.fromtimestamp(blob_date))
 
 
 if __name__ == '__main__':

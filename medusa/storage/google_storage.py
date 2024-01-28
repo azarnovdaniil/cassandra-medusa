@@ -13,119 +13,236 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import aiohttp
 import base64
+import datetime
 import io
 import itertools
-import json
 import logging
 import os
-import subprocess
-from subprocess import PIPE
+import typing as t
 
-from dateutil import parser
-from libcloud.storage.drivers.google_storage import GoogleStorageDriver
 from pathlib import Path
+from retrying import retry
 
-from medusa.storage.abstract_storage import AbstractStorage
-from medusa.storage.google_cloud_storage.gsutil import GSUtil
+from gcloud.aio.storage import Storage
+
+from medusa.storage.abstract_storage import AbstractStorage, AbstractBlob, ManifestObject, ObjectDoesNotExistError
 
 
-GSUTIL_MAX_FILES_PER_CHUNK = 64
+DOWNLOAD_STREAM_CONSUMPTION_CHUNK_SIZE = 1024 * 1024 * 5
+GOOGLE_MAX_FILES_PER_CHUNK = 64
+MAX_UP_DOWN_LOAD_RETRIES = 5
 
 
 class GoogleStorage(AbstractStorage):
 
-    def connect_storage(self):
-        with io.open(os.path.expanduser(self.config.key_file), 'r', encoding='utf-8') as json_fi:
-            credentials = json.load(json_fi)
+    def __init__(self, config):
 
-        driver = GoogleStorageDriver(
-            key=credentials['client_email'],
-            secret=credentials['private_key'],
-            project=credentials['project_id']
+        self.service_file = str(Path(config.key_file).expanduser())
+        logging.info("Using service file: {}".format(self.service_file))
+
+        self.bucket_name = config.bucket_name
+
+        logging.debug('Connecting to Google Storage')
+
+        logging.getLogger('gcloud.aio.storage.storage').setLevel(logging.WARNING)
+
+        super().__init__(config)
+
+    def connect(self):
+        self.session = aiohttp.ClientSession(
+            loop=self.get_or_create_event_loop(),
         )
 
-        return driver
+        self.gcs_storage = Storage(session=self.session, service_file=self.service_file)
 
-    def check_dependencies(self):
+    def disconnect(self):
+        logging.debug('Disconnecting from Google Storage')
+        loop = self.get_or_create_event_loop()
+        loop.run_until_complete(self._disconnect())
+
+    async def _disconnect(self):
         try:
-            subprocess.check_call(["gsutil", "help"], stdout=PIPE, stderr=PIPE)
-        except Exception:
-            raise RuntimeError(
-                "Google Cloud SDK doesn't seem to be installed on this system and is a "
-                + "required dependency for the GCS backend. "
-                + "Please check https://cloud.google.com/sdk/docs/quickstarts for installation guidelines."
+            await self.gcs_storage.close()
+            await self.session.close()
+        except Exception as e:
+            logging.error('Error disconnecting from Google Storage: {}'.format(e))
+
+    async def _list_blobs(self, prefix=None) -> t.List[AbstractBlob]:
+
+        objects = self._paginate_objects(prefix=prefix)
+
+        return [
+            AbstractBlob(
+                o['name'],
+                int(o['size']),
+                o['md5Hash'],
+                # datetime comes as a string like 2023-08-31T14:23:24.957Z
+                datetime.datetime.strptime(o['timeCreated'], '%Y-%m-%dT%H:%M:%S.%fZ')
+            )
+            async for o in objects
+        ]
+
+    async def _paginate_objects(self, prefix=None):
+
+        params = {'prefix': str(prefix)} if prefix else {}
+
+        while True:
+
+            # fetch a page
+            page = await self.gcs_storage.list_objects(
+                bucket=self.bucket_name,
+                params=params
             )
 
-    def upload_blobs(self, srcs, dest):
+            # got nothing, return from the function
+            if page.get('items') is None:
+                return
 
-        # ensure srcs is always a list
-        if isinstance(srcs, str) or isinstance(srcs, Path):
-            srcs = [srcs]
+            # yield items in the page
+            for o in page.get('items'):
+                yield o
 
-        generators = self._upload_blobs(srcs, dest)
-        return list(itertools.chain(*generators))
+            # check for next page being available
+            next_page_token = page.get('nextPageToken', None)
 
-    def _upload_blobs(self, srcs, dest):
-        with GSUtil(self.config) as gsutil:
-            for parent, src_paths in _group_by_parent(srcs):
-                yield self._upload_paths(gsutil, parent, src_paths, dest)
+            # if there is no next page, return from the function
+            if next_page_token is None:
+                return
 
-    def _upload_paths(self, gsutil, parent, src_paths, old_dest):
-        # if the parent doesn't start with a '.', it's probably business as usual
-        # if it doesn't we need to modify the dest by squeezing the new parent in
-        # so the final upload destination is `dest / parent / object`
-        # this is needed to handle things like secondary indices that live in hidden folders within table folders
-        new_dest = '{}/{}'.format(old_dest, parent) if parent.startswith('.') else old_dest
-        return gsutil.cp(
-            srcs=src_paths,
-            dst="gs://{}/{}".format(self.bucket.name, new_dest),
-            parallel_process_count=self.config.concurrent_transfers
+            # otherwise, prepare params for the next page
+            params['pageToken'] = next_page_token
+
+    @retry(stop_max_attempt_number=MAX_UP_DOWN_LOAD_RETRIES, wait_fixed=5000)
+    async def _upload_object(self, data: io.BytesIO, object_key: str, headers: t.Dict[str, str]) -> AbstractBlob:
+        logging.debug(
+            '[Storage] Uploading object from stream -> gcs://{}/{}'.format(
+                self.config.bucket_name, object_key
+            )
+        )
+        resp = await self.gcs_storage.upload(
+            bucket=self.bucket_name,
+            object_name=object_key,
+            file_data=data,
+            force_resumable_upload=True,
+            timeout=-1,
+        )
+        return AbstractBlob(resp['name'], int(resp['size']), resp['md5Hash'], resp['timeCreated'])
+
+    @retry(stop_max_attempt_number=MAX_UP_DOWN_LOAD_RETRIES, wait_fixed=5000)
+    async def _download_blob(self, src: str, dest: str):
+        blob = await self._stat_blob(src)
+        object_key = blob.name
+
+        # we must make sure the blob gets stored under sub-folder (if there is any)
+        # the dest variable only points to the table folder, so we need to add the sub-folder
+        src_path = Path(src)
+        file_path = AbstractStorage.path_maybe_with_parent(dest, src_path)
+
+        logging.debug(
+            '[Storage] Downloading gcs://{}/{} -> {}'.format(
+                self.config.bucket_name, object_key, file_path
+            )
         )
 
-    def download_blobs(self, srcs, dest):
+        try:
+            stream = await self.gcs_storage.download_stream(
+                bucket=self.bucket_name,
+                object_name=object_key,
+                timeout=-1,
+            )
+            Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(file_path, 'wb') as f:
+                while True:
+                    chunk = await stream.read(DOWNLOAD_STREAM_CONSUMPTION_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    f.write(chunk)
 
-        # src is a list of strings, each string is a path inside the backup bucket pointing to a file, or a GCS URI
-        # dst is a table full path to a temporary folder, ends with table name
+        except aiohttp.client_exceptions.ClientResponseError as cre:
+            logging.error('Error downloading file from gs://{}/{}: {}'.format(self.config.bucket_name, object_key, cre))
+            if cre.status == 404:
+                raise ObjectDoesNotExistError('Object {} does not exist'.format(object_key))
+            raise cre
 
-        # ensure srcs is always a list
-        if isinstance(srcs, str) or isinstance(srcs, Path):
-            srcs = [srcs]
+    async def _stat_blob(self, object_key: str) -> AbstractBlob:
+        blob = await self.gcs_storage.download_metadata(
+            bucket=self.bucket_name,
+            object_name=object_key,
+        )
+        return AbstractBlob(
+            blob['name'],
+            int(blob['size']),
+            blob['md5Hash'],
+            # datetime comes as a string like 2023-08-31T14:23:24.957Z
+            datetime.datetime.strptime(blob['timeCreated'], '%Y-%m-%dT%H:%M:%S.%fZ')
+        )
 
-        generators = self._download_blobs(srcs, dest)
-        return list(itertools.chain(*generators))
+    @retry(stop_max_attempt_number=MAX_UP_DOWN_LOAD_RETRIES, wait_fixed=5000)
+    async def _upload_blob(self, src: str, dest: str) -> ManifestObject:
+        src_path = Path(src)
 
-    def _download_blobs(self, srcs, dest):
-        with GSUtil(self.config) as gsutil:
-            for parent, src_paths in _group_by_parent(srcs):
-                yield self._download_paths(gsutil, parent, src_paths, dest)
+        # check if objects resides in a sub-folder (e.g. secondary index). if it does, use the sub-folder in object path
+        object_key = AbstractStorage.path_maybe_with_parent(dest, src_path)
 
-    def _download_paths(self, gsutil, parent, src_paths, old_dest):
-        new_dest = '{}/{}'.format(old_dest, parent) if parent.startswith('.') else old_dest
-        # we made src_paths a list of Path objects, but we need strings for copying
-        # plus, we must not forget to point them to the bucket
-        srcs = ['gs://{}/{}'.format(self.bucket.name, str(p)) for p in src_paths]
-        return gsutil.cp(
-            srcs=srcs,
-            dst=new_dest,
-            parallel_process_count=self.config.concurrent_transfers)
-
-    def get_object_datetime(self, blob):
-        logging.debug("Blob {} last modification time is {}".format(blob.name, blob.extra["last_modified"]))
-        return parser.parse(blob.extra["last_modified"])
-
-    def get_path_prefix(self, path):
-        return ""
-
-    def get_download_path(self, path):
-        if "gs://" in path:
-            return path
+        if src.startswith("gs"):
+            logging.debug(
+                '[GCS Storage] Copying {} -> gs://{}/{}'.format(
+                    src, self.config.bucket_name, object_key
+                )
+            )
+            resp = await self.gcs_storage.copy(
+                bucket=self.bucket_name,
+                object_name=f'{src}'.replace(f'gs://{self.bucket_name}/', ''),
+                destination_bucket=self.bucket_name,
+                new_name=object_key,
+                timeout=-1,
+            )
+            resp = resp['resource']
         else:
-            return "gs://{}/{}".format(self.bucket.name, path)
+            file_size = os.stat(src).st_size
+            logging.debug(
+                '[GCS Storage] Uploading {} ({}) -> gs://{}/{}'.format(
+                    src, self.human_readable_size(file_size), self.config.bucket_name, object_key
+                )
+            )
+            with open(src, 'rb') as src_file:
+                resp = await self.gcs_storage.upload(
+                    bucket=self.bucket_name,
+                    object_name=object_key,
+                    file_data=src_file,
+                    force_resumable_upload=True,
+                    timeout=-1,
+                )
+        mo = ManifestObject(resp['name'], int(resp['size']), resp['md5Hash'])
+        return mo
 
-    def get_cache_path(self, path):
-        # Full path for files that will be taken from previous backups
-        return self.get_download_path(path)
+    async def _get_object(self, object_key: str) -> AbstractBlob:
+        try:
+            blob = await self._stat_blob(object_key)
+            return blob
+        except aiohttp.client_exceptions.ClientResponseError as cre:
+            if cre.status == 404:
+                raise ObjectDoesNotExistError
+            raise cre
+
+    async def _read_blob_as_bytes(self, blob: AbstractBlob) -> bytes:
+        content = await self.gcs_storage.download(
+            bucket=self.bucket_name,
+            object_name=blob.name,
+            session=self.session,
+            timeout=-1
+        )
+        return content
+
+    @retry(stop_max_attempt_number=MAX_UP_DOWN_LOAD_RETRIES, wait_fixed=5000)
+    async def _delete_object(self, obj: AbstractBlob):
+        await self.gcs_storage.delete(
+            bucket=self.bucket_name,
+            object_name=obj.name,
+            timeout=-1,
+        )
 
     @staticmethod
     def blob_matches_manifest(blob, object_in_manifest, enable_md5_checks=False):
@@ -161,6 +278,17 @@ class GoogleStorage(AbstractStorage):
         )
 
         return sizes_match and hashes_match
+
+    def get_download_path(self, path):
+        if "gs://" in path:
+            return path
+        else:
+            return "gs://{}/{}".format(self.bucket_name, path)
+
+    def get_cache_path(self, path):
+        # Full path for files that will be taken from previous backups
+        return self.get_download_path(path)
+        # return path
 
 
 def _is_in_folder(file_path, folder_path):

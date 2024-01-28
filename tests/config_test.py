@@ -187,6 +187,20 @@ class ConfigTest(unittest.TestCase):
         config = medusa.config.parse_config(args, medusa_k8s_config)
         assert config['cassandra']['use_sudo'] == 'False'
 
+    def test_use_sudo_kubernetes_enabled_without_config_file(self):
+        kubernetes_args = {
+            "k8s_enabled": 'True',
+            "cassandra_url": 'https://foo:8080',
+            "use_mgmt_api": 'True'
+        }
+        args = {**kubernetes_args}
+        medusa_basic_config = pathlib.Path(__file__).parent / "resources/config/medusa.ini"
+        config = medusa.config.parse_config(args, medusa_basic_config)
+        assert config['kubernetes']['enabled'] == 'True'
+        assert config['kubernetes']['cassandra_url'] == 'https://foo:8080'
+        assert config['kubernetes']['use_mgmt_api'] == 'True'
+        assert config['cassandra']['use_sudo'] == 'False'
+
     def test_overridden_fqdn(self):
         """Ensure that a overridden fqdn in config is honored"""
         args = {'fqdn': 'overridden-fqdn'}
@@ -214,6 +228,43 @@ class ConfigTest(unittest.TestCase):
         }
         config = medusa.config.parse_config(args, self.medusa_config_file)
         assert config['storage']['fqdn'] == socket.gethostbyname(socket.getfqdn())
+
+    @patch('medusa.config.logging.error')
+    def test_slash_in_bucket_name(self, mock_log_error):
+        args = {
+            'bucket_name': 'bucket/name',
+            'cql_username': 'Priam',
+            'enabled': 'True',
+            'file': 'hera.log',
+            'monitoring_provider': 'local',
+            'query': 'SELECT * FROM greek_mythology',
+            'use_mgmt_api': 'True',
+            'username': 'Zeus',
+            'fqdn': 'localhost',
+        }
+        with self.assertRaises(SystemExit) as cm:
+            medusa.config.load_config(args, self.medusa_config_file)
+        self.assertEqual(cm.exception.code, 2)
+        mock_log_error.assert_called_with('Required configuration "bucket_name" cannot contain a slash ("/")')
+
+    @patch('medusa.config.logging.error')
+    def test_slash_in_prefix(self, mock_log_error):
+        args = {
+            'bucket_name': 'Hector',
+            'prefix': 'pre/fix',
+            'cql_username': 'Priam',
+            'enabled': 'True',
+            'file': 'hera.log',
+            'monitoring_provider': 'local',
+            'query': 'SELECT * FROM greek_mythology',
+            'use_mgmt_api': 'True',
+            'username': 'Zeus',
+            'fqdn': 'localhost',
+        }
+        with self.assertRaises(SystemExit) as cm:
+            medusa.config.load_config(args, self.medusa_config_file)
+        self.assertEqual(cm.exception.code, 2)
+        mock_log_error.assert_called_with('Required configuration "prefix" cannot contain a slash ("/")')
 
 
 if __name__ == '__main__':

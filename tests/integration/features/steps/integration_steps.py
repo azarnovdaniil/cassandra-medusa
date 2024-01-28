@@ -45,6 +45,7 @@ import medusa.fetch_tokenmap
 import medusa.index
 import medusa.listing
 import medusa.purge
+import medusa.purge_decommissioned
 import medusa.report_latest
 import medusa.restore_node
 import medusa.service.grpc.client
@@ -93,9 +94,9 @@ def kill_cassandra():
     p = subprocess.Popen(["ps", "-Af"], stdout=subprocess.PIPE)
     out, err = p.communicate()
     for line in out.splitlines():
-        if b"org.apache.cassandra.service.CassandraDaemon" in line:
-            logging.info(line)
+        if b"org.apache.cassandra.service.CassandraDaemon" in line or b"com.datastax.bdp.DseModul" in line:
             pid = int(line.split(None, 2)[1])
+            logging.info(f'Killing Cassandra or DSE with PID {pid}')
             os.kill(pid, signal.SIGKILL)
 
 
@@ -109,10 +110,9 @@ def cleanup_storage(context, storage_provider):
             shutil.rmtree(os.path.join("/tmp", "medusa_it_bucket"))
         os.makedirs(os.path.join("/tmp", "medusa_it_bucket"))
     else:
-        storage = Storage(config=context.medusa_config.storage)
-        objects = storage.storage_driver.list_objects(storage._prefix)
-        for obj in objects:
-            storage.storage_driver.delete_object(obj)
+        with Storage(config=context.medusa_config.storage) as storage:
+            objects = storage.storage_driver.list_objects(storage._prefix)
+            storage.delete_objects(objects)
 
 
 def get_client_encryption_opts(keystore_path, trustore_path):
@@ -247,9 +247,15 @@ def _i_have_a_fresh_ccm_cluster_running(context, cluster_name, client_encryption
     context.session = connect_cassandra(is_client_encryption_enable)
 
 
+@given(
+    r'I have a fresh "{num_nodes}" node ccm cluster with jolokia "{client_encryption}" running named "{cluster_name}"'
+)
+def _i_have_fresh_cluster_with_num_nodes(context, num_nodes, client_encryption, cluster_name):
+    _i_have_a_fresh_ccm_cluster_with_jolokia_running(context, cluster_name, client_encryption, num_nodes)
+
+
 @given(r'I have a fresh ccm cluster with jolokia "{client_encryption}" running named "{cluster_name}"')
-def _i_have_a_fresh_ccm_cluster_with_jolokia_running(context, cluster_name, client_encryption):
-    context.cassandra_version = "3.11.6"
+def _i_have_a_fresh_ccm_cluster_with_jolokia_running(context, cluster_name, client_encryption, num_nodes=1):
     context.session = None
     context.cluster_name = cluster_name
     is_client_encryption_enable = False
@@ -270,7 +276,7 @@ def _i_have_a_fresh_ccm_cluster_with_jolokia_running(context, cluster_name, clie
             "-v",
             "binary:" + context.cassandra_version,
             "-n",
-            "1",
+            str(num_nodes),
         ]
     )
 
@@ -335,6 +341,38 @@ def _i_have_a_fresh_ccm_cluster_with_mgmt_api_running(context, cluster_name, cli
     get_mgmt_api_jars(version=context.cassandra_version)
 
 
+@given(r'I have a fresh DSE cluster version "{dse_version}" with "{client_encryption}" running named "{cluster_name}"')
+def _i_have_a_fresh_dse_cluster(context, dse_version, client_encryption, cluster_name):
+    context.cluster_name = cluster_name
+    context.dse_version = dse_version
+    kill_cassandra()
+    subprocess.check_call([str(Path(".") / 'resources/dse/configure-dse.sh'), dse_version])
+    subprocess.check_call([str(Path(".") / 'resources/dse/start-dse.sh'), dse_version])
+
+    enable_client_server_encryption = client_encryption == 'with_client_encryption'
+    context.client_server_encryption_enabled = enable_client_server_encryption
+    context.session = connect_cassandra(enable_client_server_encryption)
+
+
+@then(r'I stop the DSE cluster')
+def _i_stop_the_dse_cluster(context):
+    subprocess.check_call([str(Path(".") / 'resources/dse/stop-dse.sh'), context.dse_version])
+
+
+@then(r'I delete the DSE cluster')
+def _i_delete_the_dse_cluster(context):
+    subprocess.check_call([str(Path(".") / 'resources/dse/delete-dse.sh'), context.dse_version])
+
+
+@when(r'I run a DSE "{command}" command')
+def _i_run_a_dse_command(context, command):
+    subprocess.check_call([
+        str(Path(".") / 'resources/dse/run-command.sh'),
+        context.dse_version,
+        *command.split(' ')
+    ])
+
+
 @given(r'I am using "{storage_provider}" as storage provider in ccm cluster "{client_encryption}"')
 def i_am_using_storage_provider(context, storage_provider, client_encryption):
     context.storage_provider = storage_provider
@@ -347,8 +385,7 @@ def i_am_using_storage_provider(context, storage_provider, client_encryption):
 @given(r'I am using "{storage_provider}" as storage provider in ccm cluster "{client_encryption}" with gRPC server')
 def i_am_using_storage_provider_with_grpc_server(context, storage_provider, client_encryption):
     config = parse_medusa_config(context, storage_provider, client_encryption,
-                                 "http://127.0.0.1:8778/jolokia/", grpc=1, use_mgmt_api=1)
-
+                                 "http://127.0.0.1:8778/jolokia/", grpc='True', use_mgmt_api='False')
     context.storage_provider = storage_provider
     context.client_encryption = client_encryption
     context.grpc_server = GRPCServer(config)
@@ -377,8 +414,14 @@ def i_am_using_storage_provider_with_grpc_server(context, storage_provider, clie
 
 @given(r'I am using "{storage_provider}" as storage provider in ccm cluster "{client_encryption}" with mgmt api')
 def i_am_using_storage_provider_with_grpc_server_and_mgmt_api(context, storage_provider, client_encryption):
-    config = parse_medusa_config(context, storage_provider, client_encryption,
-                                 "http://127.0.0.1:8080/api/v0/ops/node/snapshots", use_mgmt_api=1, grpc=1)
+    config = parse_medusa_config(
+        context,
+        storage_provider,
+        client_encryption,
+        cassandra_url="http://127.0.0.1:8080/api/v0/ops/node/snapshots",
+        use_mgmt_api='True',
+        grpc='True'
+    )
 
     context.storage_provider = storage_provider
     context.client_encryption = client_encryption
@@ -428,23 +471,42 @@ def i_am_using_storage_provider_with_grpc_server_and_mgmt_api(context, storage_p
             time.sleep(1)
 
 
-def get_args(context, storage_provider, client_encryption, cassandra_url, use_mgmt_api=0, grpc=0):
+def get_args(context, storage_provider, client_encryption, cassandra_url, use_mgmt_api='False', grpc='False'):
     logging.info(STARTING_TESTS_MSG)
     if not hasattr(context, "cluster_name"):
         context.cluster_name = "test"
 
-    storage_args = {"prefix": storage_prefix}
-    cassandra_args = {
-        "is_ccm": "1",
-        "stop_cmd": CCM_STOP,
-        "start_cmd": CCM_START,
-        "cql_username": "cassandra",
-        "cql_password": "cassandra",
-        "config_file": os.path.expanduser(
+    is_dse = hasattr(context, "dse_version")
+    if not is_dse:
+        config_file = os.path.expanduser(
             os.path.join(
                 CCM_DIR, context.cluster_name, "node1", "conf", CASSANDRA_YAML
             )
-        ),
+        )
+        nodetool_executable = None  # will come from CCM
+        nodetool_port = 7100
+        is_ccm = 1
+        start_cmd = CCM_START
+        stop_cmd = CCM_STOP
+    else:
+        cwd = Path(".").absolute()
+        relative_yaml = f'resources/dse/dse-{context.dse_version}/resources/cassandra/conf/cassandra.yaml'
+        config_file = str(cwd / relative_yaml)
+        nodetool_port = 7199
+        nodetool_relative_path = f'resources/dse/dse-{context.dse_version}/resources/cassandra/bin/nodetool'
+        nodetool_executable = str(cwd / nodetool_relative_path)
+        is_ccm = 0
+        start_cmd = f'resources/dse/start-dse.sh {context.dse_version}'
+        stop_cmd = f'resources/dse/stop-dse.sh {context.dse_version}'
+
+    storage_args = {"prefix": storage_prefix}
+    cassandra_args = {
+        "is_ccm": str(is_ccm),
+        "stop_cmd": stop_cmd,
+        "start_cmd": start_cmd,
+        "cql_username": "cassandra",
+        "cql_password": "cassandra",
+        "config_file": config_file,
         "sstableloader_bin": os.path.expanduser(
             os.path.join(
                 CCM_DIR,
@@ -457,6 +519,8 @@ def get_args(context, storage_provider, client_encryption, cassandra_url, use_mg
         ),
         "resolve_ip_addresses": "False",
         "use_sudo": "True",
+        'nodetool_executable': nodetool_executable,
+        "nodetool_port": str(nodetool_port)
     }
 
     if client_encryption == 'with_client_encryption':
@@ -473,11 +537,11 @@ def get_args(context, storage_provider, client_encryption, cassandra_url, use_mg
         )
 
     grpc_args = {
-        "enabled": grpc
+        "grpc_enabled": grpc
     }
 
     kubernetes_args = {
-        "enabled": use_mgmt_api,
+        "k8s_enabled": use_mgmt_api,
         "cassandra_url": cassandra_url,
         "use_mgmt_api": use_mgmt_api
     }
@@ -486,15 +550,23 @@ def get_args(context, storage_provider, client_encryption, cassandra_url, use_mg
     return args
 
 
-def get_medusa_config(context, storage_provider, client_encryption, cassandra_url, use_mgmt_api=0, grpc=0):
+def get_medusa_config(context, storage_provider, client_encryption, cassandra_url, use_mgmt_api='False', grpc='False'):
     args = get_args(context, storage_provider, client_encryption, cassandra_url, use_mgmt_api, grpc)
-    config_file = Path(os.path.join(os.path.abspath("."), f'resources/config/medusa-{storage_provider}.ini'))
+
+    is_dse = hasattr(context, 'dse_version')
+    if is_dse:
+        config_file = Path(os.path.join(os.path.abspath("."), f'resources/config/medusa-{storage_provider}-dse.ini'))
+    else:
+        config_file = Path(os.path.join(os.path.abspath("."), f'resources/config/medusa-{storage_provider}.ini'))
+
     create_storage_specific_resources(storage_provider)
     config = medusa.config.load_config(args, config_file)
     return config
 
 
-def parse_medusa_config(context, storage_provider, client_encryption, cassandra_url, use_mgmt_api=0, grpc=0):
+def parse_medusa_config(
+        context, storage_provider, client_encryption, cassandra_url, use_mgmt_api='False', grpc='False'
+):
     args = get_args(context, storage_provider, client_encryption, cassandra_url, use_mgmt_api, grpc)
     config_file = Path(os.path.join(os.path.abspath("."), f'resources/config/medusa-{storage_provider}.ini'))
     create_storage_specific_resources(storage_provider)
@@ -518,18 +590,65 @@ def _i_create_the_whatever_table(context, table_name, keyspace_name):
     table = "CREATE TABLE IF NOT EXISTS {}.{} (id timeuuid PRIMARY KEY, value text);"
     context.session.execute(table.format(keyspace_name, table_name))
 
+    # wait for the table to be created on both nodes
+    # normally a driver would do this, but for some reason it isn't.
+    time.sleep(1)
+
 
 @when('I create the "{table_name}" table with secondary index in keyspace "{keyspace_name}"')
 def _i_create_the_table_with_si(context, table_name, keyspace_name):
-    keyspace = """CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class':'SimpleStrategy',
-    'replication_factor':1}}"""
-    context.session.execute(keyspace.format(keyspace_name))
-
-    table = "CREATE TABLE IF NOT EXISTS {}.{} (id timeuuid PRIMARY KEY, value text);"
-    context.session.execute(table.format(keyspace_name, table_name))
+    _i_create_the_whatever_table(context, table_name, keyspace_name)
 
     si = "CREATE INDEX IF NOT EXISTS {}_idx ON {}.{} (value);"
     context.session.execute(si.format(table_name, keyspace_name, table_name))
+
+
+@when(r'I create a search index on the "{table_name}" table in keyspace "{keyspace_name}"')
+def _i_create_a_search_index(context, table_name, keyspace_name):
+    subprocess.check_call(
+        [str(Path(".") / 'resources/dse/configure-dse-search.sh'), context.dse_version, keyspace_name, table_name]
+    )
+
+
+@when("I wait for the DSE Search indexes to be rebuilt")
+def _i_wait_for_indexes_to_be_rebuilt(context):
+    session = connect_cassandra(context.client_server_encryption_enabled)
+    rows = session.execute('SELECT core_name FROM solr_admin.solr_resources')
+    fqtns_with_search = {r.core_name for r in rows}
+    assert len(fqtns_with_search) > 0
+
+    for fqtn in fqtns_with_search:
+        attempts = 0
+        while True:
+            cmd = f'dsetool core_indexing_status {fqtn}'
+            p = subprocess.Popen([
+                str(Path(".") / 'resources/dse/run-command.sh'),
+                context.dse_version,
+                *cmd.split(' ')
+            ], stdout=PIPE)
+            stdout, _ = p.communicate()
+            output = b''.join(stdout.splitlines())
+            if b'FINISHED' in output:
+                logging.debug(f'DSE Search rebuild for {fqtn} finished')
+                break
+            logging.debug(f'DSE Search rebuild for {fqtn} not yet finished, waiting...')
+            attempts += 1
+            if attempts > 5:
+                logging.error(f'DSE Search rebuild of {fqtn} did not finish in time')
+                raise RuntimeError(f'DSE Search rebuild of {fqtn} did not finish in time')
+            time.sleep(2)
+
+
+@then(r'I can make a search query against the "{keyspace_name}"."{table_name}" table')
+def _i_can_make_a_search_query(context, keyspace_name, table_name):
+
+    # make a new session because this step runs after a restart which might break the session in the context
+    session = connect_cassandra(context.client_server_encryption_enabled)
+
+    search_query = f'SELECT * FROM {keyspace_name}.{table_name} WHERE solr_query = \'{{"q":"value:42"}}\';'
+    rows = session.execute(search_query)
+    results = [r.id for r in rows]
+    assert len(results) > 0
 
 
 @when(r'I load {nb_rows} rows in the "{table_name}" table')
@@ -577,13 +696,11 @@ def _i_perform_grpc_backup_of_node_named_backupname_fails(context, backup_mode, 
 
 @then(r'I verify over gRPC that the backup "{backup_name}" exists and is of type "{backup_type}"')
 def _i_verify_over_grpc_backup_exists(context, backup_name, backup_type):
-    found = False
-    backups = context.grpc_client.get_backups()
-    for backup in backups:
-        if backup.backupName == backup_name and backup.backupType == backup_type:
-            found = True
-            break
-    assert found is True
+    backup = context.grpc_client.get_backup(backup_name=backup_name)
+    assert backup.backupName == backup_name
+    assert backup.backupType == backup_type
+    assert backup.totalSize > 0
+    assert backup.totalObjects > 0
 
 
 @then(r'I sleep for {num_secs} seconds')
@@ -606,23 +723,31 @@ def _i_verify_over_grpc_backup_has_status_unknown(context, backup_name):
 @then(r'I verify over gRPC that the backup "{backup_name}" has expected status SUCCESS')
 def _i_verify_over_grpc_backup_has_status_success(context, backup_name):
     status = context.grpc_client.get_backup_status(backup_name)
+    logging.info(f'status={status}')
     assert status == medusa_pb2.StatusType.SUCCESS
+
+
+@then(r'I verify over gRPC that I can see both backups "{backup_name_1}" and "{backup_name_2}"')
+def _i_verify_over_grpc_that_i_can_see_both_backups(context, backup_name_1, backup_name_2):
+    backups = context.grpc_client.get_backups()
+    assert len(backups) == 2
+
+    assert backups[0].backupName == backup_name_1
+    assert backups[0].nodes[0].host == "127.0.0.1"
+    assert backups[0].totalNodes == 1
+    assert backups[0].finishedNodes == 1
+    assert backups[0].status == 1
+
+    assert backups[1].backupName == backup_name_2
 
 
 @then(r'I verify over gRPC that the backup "{backup_name}" has the expected placement information')
 def _i_verify_over_grpc_backup_has_expected_information(context, backup_name):
-    found = False
-    backups = context.grpc_client.get_backups()
-    for backup in backups:
-
-        if backup.backupName == backup_name:
-            found = True
-            assert backup.nodes[0].host == "127.0.0.1"
-            assert backup.nodes[0].datacenter in ["dc1", "datacenter1", "DC1"]
-            assert backup.nodes[0].rack in ["rack1", "r1"]
-            assert len(backup.nodes[0].tokens) >= 1
-            break
-    assert found is True
+    backup = context.grpc_client.get_backup(backup_name)
+    assert backup.nodes[0].host == "127.0.0.1"
+    assert backup.nodes[0].datacenter in ["dc1", "datacenter1", "DC1"]
+    assert backup.nodes[0].rack in ["rack1", "r1"]
+    assert len(backup.nodes[0].tokens) >= 1
 
 
 @then(r'I delete the backup "{backup_name}" over gRPC')
@@ -674,14 +799,14 @@ def _i_shutdown_the_mgmt_api_server(context):
 def _i_can_see_the_backup_named_backupname_when_i_list_the_backups(
         context, backup_name
 ):
-    storage = Storage(config=context.medusa_config.storage)
-    cluster_backups = storage.list_cluster_backups()
-    found = False
-    for backup in cluster_backups:
-        if backup.name == backup_name:
-            found = True
+    with Storage(config=context.medusa_config.storage) as storage:
+        cluster_backups = storage.list_cluster_backups()
+        found = False
+        for backup in cluster_backups:
+            if backup.name == backup_name:
+                found = True
 
-    assert found is True
+        assert found is True
 
 
 @then(r'some files from the previous backup were not reuploaded')
@@ -693,44 +818,44 @@ def _some_files_from_the_previous_backup_were_not_reuploaded(context):
 def _i_cannot_see_the_backup_named_backupname_when_i_list_the_backups(
         context, backup_name
 ):
-    storage = Storage(config=context.medusa_config.storage)
-    cluster_backups = storage.list_cluster_backups()
-    found = False
-    for backup in cluster_backups:
-        if backup.name == backup_name:
-            found = True
+    with Storage(config=context.medusa_config.storage) as storage:
+        cluster_backups = storage.list_cluster_backups()
+        found = False
+        for backup in cluster_backups:
+            if backup.name == backup_name:
+                found = True
 
-    assert found is False
+        assert found is False
 
 
 @then('I can {can_see_purged} see purged backup files for the "{table_name}" table in keyspace "{keyspace}"')
 def _i_can_see_purged_backup_files_for_the_tablename_table_in_keyspace_keyspacename(
         context, can_see_purged, table_name, keyspace
 ):
-    storage = Storage(config=context.medusa_config.storage)
-    path = os.path.join(
-        storage.prefix_path + context.medusa_config.storage.fqdn, "data", keyspace, table_name
-    )
-    sb_files = len(storage.storage_driver.list_objects(path))
+    with Storage(config=context.medusa_config.storage) as storage:
+        path = os.path.join(
+            storage.prefix_path + context.medusa_config.storage.fqdn, "data", keyspace, table_name
+        )
+        sb_files = len(storage.storage_driver.list_objects(path))
 
-    node_backups = storage.list_node_backups()
-    # Parse its manifest
-    nb_list = list(node_backups)
-    nb_files = {}
-    for nb in nb_list:
-        manifest = json.loads(nb.manifest)
-        for section in manifest:
-            if (
-                    section["keyspace"] == keyspace
-                    and section["columnfamily"][: len(table_name)] == table_name
-            ):
-                for objects in section["objects"]:
-                    nb_files[objects["path"]] = 0
-    if can_see_purged == "not":
-        assert sb_files == len(nb_files)
-    else:
-        # GC grace is activated and we expect more files in the storage bucket than in the manifests
-        assert sb_files > len(nb_files)
+        node_backups = storage.list_node_backups()
+        # Parse its manifest
+        nb_list = list(node_backups)
+        nb_files = {}
+        for nb in nb_list:
+            manifest = json.loads(nb.manifest)
+            for section in manifest:
+                if (
+                        section["keyspace"] == keyspace
+                        and section["columnfamily"][: len(table_name)] == table_name
+                ):
+                    for objects in section["objects"]:
+                        nb_files[objects["path"]] = 0
+        if can_see_purged == "not":
+            assert sb_files == len(nb_files)
+        else:
+            # GC grace is activated and we expect more files in the storage bucket than in the manifests
+            assert sb_files > len(nb_files)
 
 
 @then('I can see the backup status for "{backup_name}" when I run the status command')
@@ -740,9 +865,9 @@ def _i_can_see_backup_status_when_i_run_the_status_command(context, backup_name)
 
 @then(r"I can see no backups when I list the backups")
 def _i_can_see_no_backups(context):
-    storage = Storage(config=context.medusa_config.storage)
-    cluster_backups = storage.list_cluster_backups()
-    assert 0 == len(list(cluster_backups))
+    with Storage(config=context.medusa_config.storage) as storage:
+        cluster_backups = storage.list_cluster_backups()
+        assert 0 == len(list(cluster_backups))
 
 
 @then(
@@ -752,16 +877,16 @@ def _i_can_see_no_backups(context):
 def _the_backup_named_backupname_has_nb_sstables_for_the_whatever_table(
         context, backup_name, nb_sstables, table_name, keyspace
 ):
-    storage = Storage(config=context.medusa_config.storage)
-    path = os.path.join(
-        storage.prefix_path + context.medusa_config.storage.fqdn, backup_name, "data", keyspace, table_name
-    )
-    objects = storage.storage_driver.list_objects(path)
-    sstables = list(filter(lambda obj: "-Data.db" in obj.name, objects))
-    if len(sstables) != int(nb_sstables):
-        logging.error("{} SSTables : {}".format(len(sstables), sstables))
-        logging.error("Was expecting {} SSTables".format(nb_sstables))
-        assert len(sstables) == int(nb_sstables)
+    with Storage(config=context.medusa_config.storage) as storage:
+        path = os.path.join(
+            storage.prefix_path + context.medusa_config.storage.fqdn, backup_name, "data", keyspace, table_name
+        )
+        objects = storage.storage_driver.list_objects(path)
+        sstables = list(filter(lambda obj: "-Data.db" in obj.name, objects))
+        if len(sstables) != int(nb_sstables):
+            logging.error("{} SSTables : {}".format(len(sstables), sstables))
+            logging.error("Was expecting {} SSTables".format(nb_sstables))
+            assert len(sstables) == int(nb_sstables)
 
 
 @then(r'I can verify the backup named "{backup_name}" with md5 checks "{md5_enabled_str}" successfully')
@@ -775,27 +900,27 @@ def _i_can_download_the_backup_all_tables_successfully(context, backup_name):
         if os.path.exists(temp_path) and os.path.isdir(temp_path):
             shutil.rmtree(temp_path)
 
-    storage = Storage(config=context.medusa_config.storage)
-    config = context.medusa_config
-    download_path = os.path.join("/tmp", "medusa-download-all-tables/")
-    cleanup(download_path)
-    os.makedirs(download_path)
+    with Storage(config=context.medusa_config.storage) as storage:
+        config = context.medusa_config
+        download_path = os.path.join("/tmp", "medusa-download-all-tables/")
+        cleanup(download_path)
+        os.makedirs(download_path)
 
-    backup = storage.get_node_backup(
-        fqdn=config.storage.fqdn,
-        name=backup_name,
-    )
-    keyspaces = set()
-    tables = set()
-    medusa.download.download_cmd(context.medusa_config, backup_name, Path(download_path), keyspaces, tables, False)
+        backup = storage.get_node_backup(
+            fqdn=config.storage.fqdn,
+            name=backup_name,
+        )
+        keyspaces = set()
+        tables = set()
+        medusa.download.download_cmd(context.medusa_config, backup_name, Path(download_path), keyspaces, tables, False)
 
-    # check all manifest objects that have been backed up have been downloaded
-    keyspaces = {section['keyspace'] for section in json.loads(backup.manifest) if section['objects']}
-    for ks in keyspaces:
-        ks_path = os.path.join(download_path, ks)
-        assert os.path.isdir(ks_path)
+        # check all manifest objects that have been backed up have been downloaded
+        keyspaces = {section['keyspace'] for section in json.loads(backup.manifest) if section['objects']}
+        for ks in keyspaces:
+            ks_path = os.path.join(download_path, ks)
+            assert os.path.isdir(ks_path)
 
-    cleanup(download_path)
+        cleanup(download_path)
 
 
 @then(r'I can download the backup named "{backup_name}" for "{fqtn}"')
@@ -804,29 +929,29 @@ def _i_can_download_the_backup_single_table_successfully(context, backup_name, f
         if os.path.exists(temp_path) and os.path.isdir(temp_path):
             shutil.rmtree(temp_path)
 
-    storage = Storage(config=context.medusa_config.storage)
-    config = context.medusa_config
-    download_path = os.path.join("/tmp", "medusa-download-one-table/")
-    cleanup(download_path)
-    os.makedirs(download_path)
+    with Storage(config=context.medusa_config.storage) as storage:
+        config = context.medusa_config
+        download_path = os.path.join("/tmp", "medusa-download-one-table/")
+        cleanup(download_path)
+        os.makedirs(download_path)
 
-    backup = storage.get_node_backup(
-        fqdn=config.storage.fqdn,
-        name=backup_name,
-    )
+        backup = storage.get_node_backup(
+            fqdn=config.storage.fqdn,
+            name=backup_name,
+        )
 
-    # download_data requires fqtn with table id
-    fqtns_to_download, _ = medusa.filtering.filter_fqtns([], [fqtn], backup.manifest, True)
-    medusa.download.download_data(context.medusa_config.storage, backup, fqtns_to_download, Path(download_path))
+        # download_data requires fqtn with table id
+        fqtns_to_download, _ = medusa.filtering.filter_fqtns([], [fqtn], backup.manifest, True)
+        medusa.download.download_data(context.medusa_config.storage, backup, fqtns_to_download, Path(download_path))
 
-    # check the keyspace directory has been created
-    ks, table = fqtn.split('.')
-    ks_path = os.path.join(download_path, ks)
-    assert os.path.isdir(ks_path)
+        # check the keyspace directory has been created
+        ks, table = fqtn.split('.')
+        ks_path = os.path.join(download_path, ks)
+        assert os.path.isdir(ks_path)
 
-    # check tables have been downloaded
-    assert list(Path(ks_path).glob('{}-*/*.db'.format(table)))
-    cleanup(download_path)
+        # check tables have been downloaded
+        assert list(Path(ks_path).glob('{}-*/*.db'.format(table)))
+        cleanup(download_path)
 
 
 @then(r'Test TLS version connections if "{client_encryption}" is turned on')
@@ -896,24 +1021,24 @@ def _i_have_rows_in_the_table(context, nb_rows, table_name, client_encryption):
 
 @then(r'I can see the backup index entry for "{backup_name}"')
 def _the_backup_named_backupname_is_present_in_the_index(context, backup_name):
-    storage = Storage(config=context.medusa_config.storage)
-    fqdn = context.medusa_config.storage.fqdn
-    path = os.path.join(
-        "{}index/backup_index".format(storage.prefix_path), backup_name, "tokenmap_{}.json".format(fqdn)
-    )
-    tokenmap_from_index = storage.storage_driver.get_blob_content_as_string(path)
-    path = os.path.join(storage.prefix_path + fqdn, backup_name, "meta", "tokenmap.json")
-    tokenmap_from_backup = storage.storage_driver.get_blob_content_as_string(path)
-    # Check that we have the manifest as well there
-    manifest_path = os.path.join(
-        "{}index/backup_index".format(storage.prefix_path), backup_name, "manifest_{}.json".format(fqdn)
-    )
-    manifest_from_index = storage.storage_driver.get_blob_content_as_string(
-        manifest_path
-    )
-    path = os.path.join(storage.prefix_path + fqdn, backup_name, "meta", "manifest.json")
-    manifest_from_backup = storage.storage_driver.get_blob_content_as_string(path)
-    assert (tokenmap_from_backup == tokenmap_from_index and manifest_from_backup == manifest_from_index)
+    with Storage(config=context.medusa_config.storage) as storage:
+        fqdn = context.medusa_config.storage.fqdn
+        path = os.path.join(
+            "{}index/backup_index".format(storage.prefix_path), backup_name, "tokenmap_{}.json".format(fqdn)
+        )
+        tokenmap_from_index = storage.storage_driver.get_blob_content_as_string(path)
+        path = os.path.join(storage.prefix_path + fqdn, backup_name, "meta", "tokenmap.json")
+        tokenmap_from_backup = storage.storage_driver.get_blob_content_as_string(path)
+        # Check that we have the manifest as well there
+        manifest_path = os.path.join(
+            "{}index/backup_index".format(storage.prefix_path), backup_name, "manifest_{}.json".format(fqdn)
+        )
+        manifest_from_index = storage.storage_driver.get_blob_content_as_string(
+            manifest_path
+        )
+        path = os.path.join(storage.prefix_path + fqdn, backup_name, "meta", "manifest.json")
+        manifest_from_backup = storage.storage_driver.get_blob_content_as_string(path)
+        assert (tokenmap_from_backup == tokenmap_from_index and manifest_from_backup == manifest_from_index)
 
 
 @then(
@@ -922,107 +1047,107 @@ def _the_backup_named_backupname_is_present_in_the_index(context, backup_name):
 def _the_latest_backup_for_fqdn_is_called_backupname(
         context, expected_fqdn, expected_backup_name
 ):
-    storage = Storage(config=context.medusa_config.storage)
-    latest_backup = storage.latest_node_backup(fqdn=expected_fqdn)
-    assert latest_backup.name == expected_backup_name
+    with Storage(config=context.medusa_config.storage) as storage:
+        latest_backup = storage.latest_node_backup(fqdn=expected_fqdn)
+        assert latest_backup.name == expected_backup_name
 
 
 @then(r'there is no latest backup for node "{fqdn}"')
 def _there_is_no_latest_backup_for_node_fqdn(context, fqdn):
-    storage = Storage(config=context.medusa_config.storage)
-    node_backup = storage.latest_node_backup(fqdn=fqdn)
-    logging.info("Latest node backup is {}".format(
-        node_backup.name if node_backup is not None else "None"))
-    assert node_backup is None
+    with Storage(config=context.medusa_config.storage) as storage:
+        node_backup = storage.latest_node_backup(fqdn=fqdn)
+        logging.info("Latest node backup is {}".format(
+            node_backup.name if node_backup is not None else "None"))
+        assert node_backup is None
 
 
 @when(
     r'node "{fqdn}" fakes a complete backup named "{backup_name}" on "{backup_datetime}"'
 )
 def _node_fakes_a_complete_backup(context, fqdn, backup_name, backup_datetime):
-    storage = Storage(config=context.medusa_config.storage)
-    path_root = BUCKET_ROOT
+    with Storage(config=context.medusa_config.storage) as storage:
+        path_root = BUCKET_ROOT
 
-    fake_tokenmap = json.dumps(
-        {
-            "n1": {"tokens": [1], "is_up": True},
-            "n2": {"tokens": [2], "is_up": True},
-            "n3": {"tokens": [3], "is_up": True},
-        }
-    )
+        fake_tokenmap = json.dumps(
+            {
+                "n1": {"tokens": [1], "is_up": True},
+                "n2": {"tokens": [2], "is_up": True},
+                "n3": {"tokens": [3], "is_up": True},
+            }
+        )
 
-    dir_path = os.path.join(path_root, storage.prefix_path + "index", "backup_index", backup_name)
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
+        dir_path = os.path.join(path_root, storage.prefix_path + "index", "backup_index", backup_name)
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path)
 
-    # fake token map, manifest and schema in index
-    path_tokenmap = "{}/{}index/backup_index/{}/tokenmap_{}.json".format(
-        path_root, storage.prefix_path, backup_name, fqdn
-    )
-    write_dummy_file(path_tokenmap, backup_datetime, fake_tokenmap)
-    path_manifest = "{}/{}index/backup_index/{}/manifest_{}.json".format(
-        path_root, storage.prefix_path, backup_name, fqdn
-    )
-    write_dummy_file(path_manifest, backup_datetime, fake_tokenmap)
-    path_schema = "{}/{}index/backup_index/{}/schema_{}.cql".format(
-        path_root, storage.prefix_path, backup_name, fqdn
-    )
-    write_dummy_file(path_schema, backup_datetime, fake_tokenmap)
+        # fake token map, manifest and schema in index
+        path_tokenmap = "{}/{}index/backup_index/{}/tokenmap_{}.json".format(
+            path_root, storage.prefix_path, backup_name, fqdn
+        )
+        write_dummy_file(path_tokenmap, backup_datetime, fake_tokenmap)
+        path_manifest = "{}/{}index/backup_index/{}/manifest_{}.json".format(
+            path_root, storage.prefix_path, backup_name, fqdn
+        )
+        write_dummy_file(path_manifest, backup_datetime, fake_tokenmap)
+        path_schema = "{}/{}index/backup_index/{}/schema_{}.cql".format(
+            path_root, storage.prefix_path, backup_name, fqdn
+        )
+        write_dummy_file(path_schema, backup_datetime, fake_tokenmap)
 
-    dir_path = os.path.join(path_root, storage.prefix_path + "index", "latest_backup", fqdn)
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
+        dir_path = os.path.join(path_root, storage.prefix_path + "index", "latest_backup", fqdn)
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path)
 
-    # fake token map in latest_backup
-    path_latest_backup_tokenmap = "{}/{}index/latest_backup/{}/tokenmap.json".format(
-        path_root, storage.prefix_path, fqdn
-    )
-    write_dummy_file(path_latest_backup_tokenmap, backup_datetime, fake_tokenmap)
+        # fake token map in latest_backup
+        path_latest_backup_tokenmap = "{}/{}index/latest_backup/{}/tokenmap.json".format(
+            path_root, storage.prefix_path, fqdn
+        )
+        write_dummy_file(path_latest_backup_tokenmap, backup_datetime, fake_tokenmap)
 
-    # fake token name in latest_backup
-    path_latest_backup_name = "{}/{}index/latest_backup/{}/backup_name.txt".format(
-        path_root, storage.prefix_path, fqdn
-    )
-    write_dummy_file(path_latest_backup_name, backup_datetime)
+        # fake token name in latest_backup
+        path_latest_backup_name = "{}/{}index/latest_backup/{}/backup_name.txt".format(
+            path_root, storage.prefix_path, fqdn
+        )
+        write_dummy_file(path_latest_backup_name, backup_datetime)
 
-    # fake actual backup folder
-    dir_path = os.path.join(path_root, storage.prefix_path + fqdn, backup_name, "meta")
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
+        # fake actual backup folder
+        dir_path = os.path.join(path_root, storage.prefix_path + fqdn, backup_name, "meta")
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path)
 
-    # fake schema in actual backup path
-    path_schema = "{}/{}{}/{}/meta/schema.cql".format(path_root, storage.prefix_path, fqdn, backup_name)
-    write_dummy_file(path_schema, backup_datetime)
+        # fake schema in actual backup path
+        path_schema = "{}/{}{}/{}/meta/schema.cql".format(path_root, storage.prefix_path, fqdn, backup_name)
+        write_dummy_file(path_schema, backup_datetime)
 
-    # fake manifest in actual backup path
-    path_manifest = "{}/{}{}/{}/meta/manifest.json".format(path_root, storage.prefix_path, fqdn, backup_name)
-    write_dummy_file(path_manifest, backup_datetime)
+        # fake manifest in actual backup path
+        path_manifest = "{}/{}{}/{}/meta/manifest.json".format(path_root, storage.prefix_path, fqdn, backup_name)
+        write_dummy_file(path_manifest, backup_datetime)
 
-    # fake token map in actual backup path
-    path_tokenmap = "{}/{}{}/{}/meta/tokenmap.json".format(path_root, storage.prefix_path, fqdn, backup_name)
-    write_dummy_file(path_tokenmap, backup_datetime, fake_tokenmap)
+        # fake token map in actual backup path
+        path_tokenmap = "{}/{}{}/{}/meta/tokenmap.json".format(path_root, storage.prefix_path, fqdn, backup_name)
+        write_dummy_file(path_tokenmap, backup_datetime, fake_tokenmap)
 
 
 @then(r'the latest cluster backup is "{expected_backup_name}"')
 def _the_latest_cluster_backup_is(context, expected_backup_name):
-    storage = Storage(config=context.medusa_config.storage)
-    backup = storage.latest_cluster_backup()
-    assert expected_backup_name == backup.name
+    with Storage(config=context.medusa_config.storage) as storage:
+        backup = storage.latest_cluster_backup()
+        assert expected_backup_name == backup.name
 
 
 @then(r'listing backups for node "{fqdn}" returns {nb_backups} backups')
 def _listing_backups_for_node_returns(context, fqdn, nb_backups):
-    storage = Storage(config=context.medusa_config.storage)
-    backup_index = storage.list_backup_index_blobs()
-    backups = list(storage.list_node_backups(fqdn=fqdn, backup_index_blobs=backup_index))
-    assert int(nb_backups) == len(backups)
+    with Storage(config=context.medusa_config.storage) as storage:
+        backup_index = storage.list_backup_index_blobs()
+        backups = list(storage.list_node_backups(fqdn=fqdn, backup_index_blobs=backup_index))
+        assert int(nb_backups) == len(backups)
 
 
 @then(r"there is no latest complete backup")
 def _there_is_no_latest_complete_backup(context):
-    storage = Storage(config=context.medusa_config.storage)
-    actual_backup = storage.latest_complete_cluster_backup()
-    assert actual_backup is None
+    with Storage(config=context.medusa_config.storage) as storage:
+        actual_backup = storage.latest_complete_cluster_backup()
+        assert actual_backup is None
 
 
 @then(r"I can list and print backups without errors")
@@ -1032,26 +1157,26 @@ def _can_list_print_backups_without_error(context):
 
 @then(r'the latest complete cluster backup is "{expected_backup_name}"')
 def _the_latest_complete_cluster_backup_is(context, expected_backup_name):
-    storage = Storage(config=context.medusa_config.storage)
-    actual_backup = storage.latest_complete_cluster_backup()
-    if actual_backup is not None:
-        assert expected_backup_name == actual_backup.name
+    with Storage(config=context.medusa_config.storage) as storage:
+        actual_backup = storage.latest_complete_cluster_backup()
+        if actual_backup is not None:
+            assert expected_backup_name == actual_backup.name
 
 
 @when(r"I truncate the backup index")
 def _truncate_the_index(context):
-    storage = Storage(config=context.medusa_config.storage)
-    path_root = BUCKET_ROOT
-    index_path = "{}/{}index".format(path_root, storage.prefix_path)
-    shutil.rmtree(index_path)
+    with Storage(config=context.medusa_config.storage) as storage:
+        path_root = BUCKET_ROOT
+        index_path = "{}/{}index".format(path_root, storage.prefix_path)
+        shutil.rmtree(index_path)
 
 
 @when(r"I truncate the backup folder")
 def _truncate_the_backup_folder(context):
-    storage = Storage(config=context.medusa_config.storage)
-    path_root = BUCKET_ROOT
-    backup_path = "{}/{}127.0.0.1".format(path_root, storage.prefix_path)
-    shutil.rmtree(backup_path)
+    with Storage(config=context.medusa_config.storage) as storage:
+        path_root = BUCKET_ROOT
+        backup_path = "{}/{}127.0.0.1".format(path_root, storage.prefix_path)
+        shutil.rmtree(backup_path)
 
 
 @when(r"I re-create the backup index")
@@ -1066,14 +1191,14 @@ def _can_report_backups_without_errors(context):
 
 @then(r"the backup index does not exist")
 def _the_backup_index_does_not_exist(context):
-    storage = Storage(config=context.medusa_config.storage)
-    assert False is medusa.index.index_exists(storage)
+    with Storage(config=context.medusa_config.storage) as storage:
+        assert False is medusa.index.index_exists(storage)
 
 
 @then(r"the backup index exists")
 def _the_backup_index_exists(context):
-    storage = Storage(config=context.medusa_config.storage)
-    assert True is medusa.index.index_exists(storage)
+    with Storage(config=context.medusa_config.storage) as storage:
+        assert True is medusa.index.index_exists(storage)
 
 
 @then(
@@ -1082,16 +1207,16 @@ def _the_backup_index_exists(context):
 def _i_can_see_nb_sstables_in_the_sstable_pool(
         context, nb_sstables, table_name, keyspace
 ):
-    storage = Storage(config=context.medusa_config.storage)
-    path = os.path.join(
-        storage.prefix_path + context.medusa_config.storage.fqdn, "data", keyspace, table_name
-    )
-    objects = storage.storage_driver.list_objects(path)
-    sstables = list(filter(lambda obj: "-Data.db" in obj.name, objects))
-    if len(sstables) != int(nb_sstables):
-        logging.error("{} SSTables : {}".format(len(sstables), sstables))
-        logging.error("Was expecting {} SSTables".format(nb_sstables))
-        assert len(sstables) == int(nb_sstables)
+    with Storage(config=context.medusa_config.storage) as storage:
+        path = os.path.join(
+            storage.prefix_path + context.medusa_config.storage.fqdn, "data", keyspace, table_name
+        )
+        objects = storage.storage_driver.list_objects(path)
+        sstables = list(filter(lambda obj: "-Data.db" in obj.name, objects))
+        if len(sstables) != int(nb_sstables):
+            logging.error("{} SSTables : {}".format(len(sstables), sstables))
+            logging.error("Was expecting {} SSTables".format(nb_sstables))
+            assert len(sstables) == int(nb_sstables)
 
 
 @then(
@@ -1101,43 +1226,43 @@ def _i_can_see_nb_sstables_in_the_sstable_pool(
 def _backup_named_something_has_nb_files_in_the_manifest(
         context, backup_name, nb_files, table_name, keyspace_name
 ):
-    storage = Storage(config=context.medusa_config.storage)
-    node_backups = storage.list_node_backups()
-    # Find the backup we're looking for
-    target_backup = list(
-        filter(lambda backup: backup.name == backup_name, node_backups)
-    )[0]
-    # Parse its manifest
-    manifest = json.loads(target_backup.manifest)
-    for section in manifest:
-        if (
-                section["keyspace"] == keyspace_name
-                and section["columnfamily"][: len(table_name)] == table_name
-        ):
-            if len(section["objects"]) != int(nb_files):
-                logging.error(
-                    "Was expecting {} files, got {}".format(
-                        nb_files, len(section["objects"])
+    with Storage(config=context.medusa_config.storage) as storage:
+        node_backups = storage.list_node_backups()
+        # Find the backup we're looking for
+        target_backup = list(
+            filter(lambda backup: backup.name == backup_name, node_backups)
+        )[0]
+        # Parse its manifest
+        manifest = json.loads(target_backup.manifest)
+        for section in manifest:
+            if (
+                    section["keyspace"] == keyspace_name
+                    and section["columnfamily"][: len(table_name)] == table_name
+            ):
+                if len(section["objects"]) != int(nb_files):
+                    logging.error(
+                        "Was expecting {} files, got {}".format(
+                            nb_files, len(section["objects"])
+                        )
                     )
-                )
-                logging.error(
-                    "Files in the manifest: {}".format(section["objects"])
-                )
-                assert len(section["objects"]) == int(nb_files)
+                    logging.error(
+                        "Files in the manifest: {}".format(section["objects"])
+                    )
+                    assert len(section["objects"]) == int(nb_files)
 
 
 @then(r'I can see secondary index files in the "{backup_name}" files')
 def _i_can_see_secondary_index_files_in_backup(context, backup_name):
-    storage = Storage(config=context.medusa_config.storage)
-    node_backups = storage.list_node_backups()
-    target_backup = list(filter(lambda backup: backup.name == backup_name, node_backups))[0]
-    manifest = json.loads(target_backup.manifest)
-    seen_index_files = 0
-    for section in manifest:
-        for f in section['objects']:
-            if 'idx' in f['path']:
-                seen_index_files += 1
-    assert seen_index_files > 0
+    with Storage(config=context.medusa_config.storage) as storage:
+        node_backups = storage.list_node_backups()
+        target_backup = list(filter(lambda backup: backup.name == backup_name, node_backups))[0]
+        manifest = json.loads(target_backup.manifest)
+        seen_index_files = 0
+        for section in manifest:
+            for f in section['objects']:
+                if 'idx' in f['path']:
+                    seen_index_files += 1
+        assert seen_index_files > 0
 
 
 @then(r'verify fails on the backup named "{backup_name}"')
@@ -1196,75 +1321,80 @@ def _i_can_verify_the_restore_verify_query_returned_rows(context, query, expecte
 
 @then(r'I delete the manifest from the backup named "{backup_name}"')
 def _i_delete_the_manifest_from_the_backup_named(context, backup_name):
-    storage = Storage(config=context.medusa_config.storage)
-    path_root = BUCKET_ROOT
+    with Storage(config=context.medusa_config.storage) as storage:
+        path_root = BUCKET_ROOT
 
-    fqdn = "127.0.0.1"
-    path_manifest_index_latest = "{}/{}index/backup_index/{}/manifest_{}.json".format(
-        path_root, storage.prefix_path, backup_name, fqdn
-    )
-    path_backup_index = "{}/{}index/backup_index/{}".format(
-        path_root, storage.prefix_path, backup_name
-    )
-    path_manifest_backup = "{}/{}{}/{}/meta/manifest.json".format(
-        path_root, storage.prefix_path, fqdn, backup_name, fqdn
-    )
+        fqdn = "127.0.0.1"
+        path_manifest_index_latest = "{}/{}index/backup_index/{}/manifest_{}.json".format(
+            path_root, storage.prefix_path, backup_name, fqdn
+        )
+        path_backup_index = "{}/{}index/backup_index/{}".format(
+            path_root, storage.prefix_path, backup_name
+        )
+        path_manifest_backup = "{}/{}{}/{}/meta/manifest.json".format(
+            path_root, storage.prefix_path, fqdn, backup_name, fqdn
+        )
 
-    os.remove(path_manifest_backup)
-    os.remove(path_manifest_index_latest)
+        os.remove(path_manifest_backup)
+        os.remove(path_manifest_index_latest)
 
-    meta_files = os.listdir(path_backup_index)
-    for meta_file in meta_files:
-        if meta_file.startswith("finished"):
-            os.remove(os.path.join(path_backup_index, meta_file))
+        meta_files = os.listdir(path_backup_index)
+        for meta_file in meta_files:
+            if meta_file.startswith("finished"):
+                os.remove(os.path.join(path_backup_index, meta_file))
 
 
 @then(r'I delete the manifest from the backup named "{backup_name}" from the storage')
 def _i_delete_the_manifest_from_the_backup_named_from_the_storage(context, backup_name):
-    storage = Storage(config=context.medusa_config.storage)
+    with Storage(config=context.medusa_config.storage) as storage:
 
-    fqdn = context.medusa_config.storage.fqdn
-    path_manifest_index_latest = "{}index/backup_index/{}/manifest_{}.json".format(
-        storage.prefix_path, backup_name, fqdn
-    )
-    path_backup_index = "{}index/backup_index/{}".format(
-        storage.prefix_path, backup_name
-    )
-    path_manifest_backup = "{}{}/{}/meta/manifest.json".format(
-        storage.prefix_path, fqdn, backup_name
-    )
+        fqdn = context.medusa_config.storage.fqdn
+        path_manifest_index_latest = "{}index/backup_index/{}/manifest_{}.json".format(
+            storage.prefix_path, backup_name, fqdn
+        )
+        path_backup_index = "{}index/backup_index/{}".format(
+            storage.prefix_path, backup_name
+        )
+        path_manifest_backup = "{}{}/{}/meta/manifest.json".format(
+            storage.prefix_path, fqdn, backup_name
+        )
 
-    storage.storage_driver.get_blob(path_manifest_backup).delete()
-    storage.storage_driver.get_blob(path_manifest_index_latest).delete()
+        blob = storage.storage_driver.get_blob(path_manifest_backup)
+        storage.storage_driver.delete_object(blob)
+        blob = storage.storage_driver.get_blob(path_manifest_index_latest)
+        storage.storage_driver.delete_object(blob)
 
-    meta_files = storage.storage_driver.list_objects(path_backup_index)
-    for meta_file in meta_files:
-        if meta_file.name.split("/")[-1].startswith("finished"):
-            storage.storage_driver.delete_object(meta_file)
+        meta_files = storage.storage_driver.list_objects(path_backup_index)
+        for meta_file in meta_files:
+            if meta_file.name.split("/")[-1].startswith("finished"):
+                storage.storage_driver.delete_object(meta_file)
 
 
 @then(r'the backup named "{backup_name}" is incomplete')
 def _the_backup_named_is_incomplete(context, backup_name):
-    backups = medusa.listing.list_backups(config=context.medusa_config, show_all=True)
-    for backup in backups:
-        if backup.name == backup_name:
-            assert not backup.finished
+    with Storage(config=context.medusa_config.storage) as storage:
+        backups = medusa.listing.list_backups_w_storage(config=context.medusa_config, show_all=True, storage=storage)
+        for backup in backups:
+            if backup.name == backup_name:
+                assert not backup.finished
 
 
 @then(u'I delete a random sstable from backup "{backup_name}" in the "{table}" table in keyspace "{keyspace}"')
 def _i_delete_a_random_sstable(context, backup_name, table, keyspace):
-    storage = Storage(config=context.medusa_config.storage)
-    path_root = BUCKET_ROOT
+    with Storage(config=context.medusa_config.storage) as storage:
+        path_root = BUCKET_ROOT
 
-    fqdn = "127.0.0.1"
-    path_sstables = "{}/{}{}/{}/data/{}/{}*".format(
-        path_root, storage.prefix_path, fqdn, backup_name, keyspace, table
-    )
+        fqdn = "127.0.0.1"
+        path_sstables = "{}/{}{}/{}/data/{}/{}*".format(
+            path_root, storage.prefix_path, fqdn, backup_name, keyspace, table
+        )
 
-    table_path = glob.glob(path_sstables)[0]
-    sstable_files = os.listdir(table_path)
-    random.shuffle(sstable_files)
-    os.remove(os.path.join(table_path, sstable_files[0]))
+        table_path = glob.glob(path_sstables)[0]
+        sstable_files = os.listdir(table_path)
+        # Exclude Statistics.db files from sstables_files as they will be ignored by verify.
+        sstable_files = [x for x in sstable_files if '-Statistics.db' not in x]
+        random.shuffle(sstable_files)
+        os.remove(os.path.join(table_path, sstable_files[0]))
 
 
 @then(r'verifying backup "{backup_name}" fails')
@@ -1289,6 +1419,85 @@ def _i_can_fecth_tokenmap_of_backup_named(context, backup_name):
     assert "127.0.0.1" in tokenmap
 
 
+@then(r'the schema of the backup named "{backup_name}" was uploaded with KMS key according to "{storage_provider}"')
+def _the_schema_was_uploaded_with_kms_key_according_to_storage(context, backup_name, storage_provider):
+
+    # testing server-side encryption is not irrelevant when running with local storage
+    if storage_provider == 'local':
+        return
+
+    # we're testing the schema blob, because that one is written from a string
+    # which is a different code path than actual SSTables
+
+    # initialise storage with (or without) KMS according to the config
+    context.storage_provider = storage_provider
+    context.client_encryption = 'without_client_encryption'
+    context.medusa_config = get_medusa_config(context, storage_provider, context.client_encryption, None)
+
+    with Storage(config=context.medusa_config.storage) as storage:
+        # pick a sample blob, in this case the schema one
+        index_bobs = storage.list_backup_index_blobs()
+        blobs_by_backup = storage.group_backup_index_by_backup_and_node(index_bobs)
+        schema_blob = storage.lookup_blob(blobs_by_backup, backup_name, context.medusa_config.storage.fqdn, 'schema')
+        schema_blob_metadata = storage.storage_driver.get_blob_metadata(schema_blob.name)
+
+        # assert situation when the server-side encryption is not enabled
+        if context.medusa_config.storage.kms_id is not None:
+            # assert the kms is enabled for the blob
+            assert True is schema_blob_metadata.sse_enabled
+            # assert the KMS key is present and that it equals the one from the config
+            assert None is not schema_blob_metadata.sse_key_id
+            assert context.medusa_config.storage.kms_id == schema_blob_metadata.sse_key_id
+        else:
+            # if the KMS is not enabled, we check for SSE being disabled and the key being absent
+            assert False is schema_blob_metadata.sse_enabled
+            assert None is schema_blob_metadata.sse_key_id
+
+
+@then(
+    r'all files of "{fqtn}" in "{backup_name}" were uploaded with KMS key as configured in "{storage_provider}"'
+)
+def _all_files_of_table_in_backup_were_uploaded_with_key_configured_in_storage_config(
+        context, fqtn, backup_name, storage_provider
+):
+    # testing server-side encryption is not irrelevant when running with local storage
+    if storage_provider == 'local':
+        return
+
+    # in this step we're testing the code path that uploads actual files (not just stuff written directly)
+
+    # initialise storage with (or without) KMS according to the config
+    context.storage_provider = storage_provider
+    context.client_encryption = 'without_client_encryption'
+    context.medusa_config = get_medusa_config(context, storage_provider, context.client_encryption, None)
+
+    with Storage(config=context.medusa_config.storage) as storage:
+
+        node_backup = storage.get_node_backup(fqdn=context.medusa_config.storage.fqdn, name=backup_name)
+        manifest = json.loads(node_backup.manifest)
+        for section in manifest:
+
+            if fqtn != "{}.{}".format(section['keyspace'], section['columnfamily']):
+                continue
+
+            srcs = [
+                '{}{}'.format(storage.storage_driver.get_path_prefix(node_backup.data_path), obj['path'])
+                for obj in section['objects']
+            ]
+            for blob_metadata in storage.storage_driver.get_blobs_metadata(srcs):
+                # assert situation when the server-side encryption is not enabled
+                if context.medusa_config.storage.kms_id is not None:
+                    # assert the kms is enabled for the blob
+                    assert True is blob_metadata.sse_enabled
+                    # assert the KMS key is present and that it equals the one from the config
+                    assert None is not blob_metadata.sse_key_id
+                    assert context.medusa_config.storage.kms_id is blob_metadata.sse_key_id
+                else:
+                    # if the KMS is not enabled, we check for SSE being disabled and the key being absent
+                    assert False is blob_metadata.sse_enabled
+                    assert None is blob_metadata.sse_key_id
+
+
 @when(r'I perform a purge over gRPC')
 def _i_perform_a_purge_over_grpc_with_a_max_backup_count(context):
     context.purge_result = context.grpc_client.purge_backups()
@@ -1302,6 +1511,86 @@ def _backup_has_been_purged(context, nb_purged_backups):
 @then(r'I wait for {pause_duration} seconds')
 def _i_wait_for_seconds(context, pause_duration):
     time.sleep(int(pause_duration))
+
+
+@then(r'I modify Statistics.db file in the backup in the "{table}" table in keyspace "{keyspace}"')
+def _i_modify_a_statistics_db_file(context, table, keyspace):
+    with Storage(config=context.medusa_config.storage) as storage:
+        path_root = BUCKET_ROOT
+
+        fqdn = "127.0.0.1"
+        path_sstables = "{}/{}{}/data/{}/{}*".format(
+            path_root, storage.prefix_path, fqdn, keyspace, table
+        )
+        table_path = glob.glob(path_sstables)[0]
+        sstable_files = os.listdir(table_path)
+        statistics_db_files = [file for file in sstable_files if '-Statistics.db' in file]
+        path_statistics_db_file = os.path.join(table_path, statistics_db_files[0])
+        with open(path_statistics_db_file, 'a') as file:
+            file.write('Adding some additional characters')
+
+
+@then(r'checking the list of decommissioned nodes returns "{expected_node}"')
+def _checking_list_of_decommissioned_nodes(context, expected_node):
+    # Get all nodes having backups
+    with Storage(config=context.medusa_config.storage) as storage:
+        blobs = storage.list_root_blobs()
+        all_nodes = medusa.purge_decommissioned.get_all_nodes(blobs)
+
+        # Get live nodes
+        live_nodes = medusa.purge_decommissioned.get_live_nodes(context.medusa_config)
+
+        # Get decommissioned nodes
+        decommissioned_nodes = medusa.purge_decommissioned.get_decommissioned_nodes(all_nodes, live_nodes)
+
+        assert expected_node in decommissioned_nodes
+
+
+@when(r'I run a purge on decommissioned nodes')
+def _run_purge_on_decommissioned_nodes(context):
+    try:
+        medusa.purge_decommissioned.main(context.medusa_config)
+
+    except Exception as e:
+        logging.error('This error happened during the purge of decommissioned nodes: {}'.format(str(e)))
+        raise e
+
+
+@when(r'I write "{file_cnt}" files to storage')
+def _i_write_count_files_to_storage(context, file_cnt):
+    key_content_pairs = [
+        (f'{context.medusa_config.storage.prefix}/key{i}', 'some content')
+        for i in range(int(file_cnt))
+    ]
+    with Storage(config=context.medusa_config.storage) as storage:
+        # upload the blobs all in parallel, disregarding the parallelism in medusa's config
+        # this saves about 2 minutes of the test run time
+        storage.storage_driver.upload_blobs_from_strings(key_content_pairs, concurrent_transfers=len(key_content_pairs))
+
+
+@then(r'I can list all "{file_cnt}" files in the storage')
+def _i_can_list_all_count_files_in_storage(context, file_cnt):
+    with Storage(config=context.medusa_config.storage) as storage:
+        root_blobs = storage.list_root_blobs()
+        logging.info(f"Listed {len(root_blobs)} blobs")
+        context.blobs_to_delete = root_blobs
+        assert int(file_cnt) == len(root_blobs)
+
+
+@then(u'I clean up the files')
+def _i_clean_up_the_files(context):
+    with Storage(config=context.medusa_config.storage) as storage:
+        # save another minute by deleting stuff all at once
+        storage.delete_objects(context.blobs_to_delete, concurrent_transfers=len(context.blobs_to_delete))
+        assert 0 == len(storage.list_root_blobs())
+
+
+@then(u'the backup "{backup_name}" has server_type "{server_type}" in its metadata')
+def _backup_has_server_type_and_release_version(context, backup_name, server_type):
+    with Storage(config=context.medusa_config.storage) as storage:
+        node_backup = storage.get_node_backup(fqdn=context.medusa_config.storage.fqdn, name=backup_name)
+        assert server_type == node_backup.server_type
+        # not asserting for release_version because it's hard to get the Cassandra's one
 
 
 def connect_cassandra(is_client_encryption_enable, tls_version=PROTOCOL_TLS):

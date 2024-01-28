@@ -29,9 +29,12 @@ Feature: Integration tests
         When I run a "ccm node1 nodetool -- -Dcom.sun.jndi.rmiURLParsing=legacy flush" command
         When I perform a backup in "full" mode of the node named "first_backup" with md5 checks "disabled"
         Then I can see the backup named "first_backup" when I list the backups
+        And the backup "first_backup" has server_type "cassandra" in its metadata
+        And all files of "medusa.test" in "first_backup" were uploaded with KMS key as configured in "<storage>"
         Then I can download the backup named "first_backup" for all tables
         Then I can download the backup named "first_backup" for "medusa.test"
         And I can fetch the tokenmap of the backup named "first_backup"
+        And the schema of the backup named "first_backup" was uploaded with KMS key according to "<storage>"
         Then I can see the backup status for "first_backup" when I run the status command
         Then backup named "first_backup" has 32 files in the manifest for the "test" table in keyspace "medusa"
         Then the backup index exists
@@ -708,6 +711,7 @@ Feature: Integration tests
         Then I wait for 10 seconds
         When I perform a backup over gRPC in "differential" mode of the node named "grpc_backup_2_2"
         Then I verify over gRPC that the backup "grpc_backup_2_2" exists and is of type "differential"
+        And I verify over gRPC that I can see both backups "grpc_backup_2" and "grpc_backup_2_2"
         Then I can see the backup index entry for "grpc_backup_2_2"
         Then I can see the latest backup for "127.0.0.1" being called "grpc_backup_2_2"
         When I perform a purge over gRPC
@@ -742,6 +746,11 @@ Feature: Integration tests
         Examples: Local storage
         | storage           | client encryption |
         | local      |  with_client_encryption |
+
+        @s3
+        Examples: S3 storage
+        | storage           | client encryption |
+        | s3_us_west_oregon     |  without_client_encryption |
 
     @18 @skip-cassandra-2
     Scenario Outline: Perform differential backups over gRPC , verify its index, then delete it over gRPC with management API
@@ -948,3 +957,139 @@ Feature: Integration tests
         Examples: Local storage
         | storage           | client encryption |
         | local      |  with_client_encryption |
+    
+
+    @25
+    Scenario Outline: Perform an differential backup, verify it, modify Statistics.db file, verify it
+        Given I have a fresh ccm cluster "<client encryption>" running named "scenario25"
+        Given I am using "<storage>" as storage provider in ccm cluster "<client encryption>"
+        When I create the "test" table in keyspace "medusa"
+        When I load 100 rows in the "medusa.test" table
+        When I run a "ccm node1 nodetool -- -Dcom.sun.jndi.rmiURLParsing=legacy flush" command
+        When I perform a backup in "differential" mode of the node named "first_backup" with md5 checks "enabled"
+        Then I can see the backup named "first_backup" when I list the backups
+        Then I can verify the backup named "first_backup" with md5 checks "enabled" successfully
+        Then I modify Statistics.db file in the backup in the "test" table in keyspace "medusa"
+        Then I can verify the backup named "first_backup" with md5 checks "enabled" successfully
+        
+
+        @local
+        Examples: Local storage
+        | storage           | client encryption |
+        | local      |  with_client_encryption |  
+
+    # TODO: some steps weren't implemented. Disabling the test until all steps are.
+    #@26
+    #Scenario Outline: Test purge of decommissioned nodes
+    #Given I have a fresh ccm cluster "<client encryption>" running named "scenario26"
+    #    Given I am using "<storage>" as storage provider in ccm cluster "<client encryption>"
+    #    When node "127.0.0.2" fakes a complete backup named "backup1" on "2019-04-15 12:12:00"
+    #    Then I can see the backup named "backup1" when I list the backups
+    #    When I create the "test" table in keyspace "medusa"
+    #    When I perform a backup in "differential" mode of the node named "backup2" with md5 checks "disabled"
+    #    Then checking the list of decommissioned nodes returns "127.0.0.2"
+    #    When I run a purge on decommissioned nodes
+    #    Then I cannot see the backup named "backup1" when I list the backups
+    #    Then I can see the backup named "backup2" when I list the backups
+    #
+    #    
+    #
+    #    @local
+    #    Examples: Local storage
+    #    | storage           | client encryption |
+    #    | local      |  with_client_encryption |
+
+    @27
+    Scenario Outline: Write a lot of files to storage, then try to list them
+    Given I am using "<storage>" as storage provider in ccm cluster "<client encryption>"
+    When I write "1042" files to storage
+    Then I can list all "1042" files in the storage
+    Then I clean up the files
+
+    @local
+    Examples: Local storage
+    | storage    | client encryption |
+    | local      | without_client_encryption |
+
+    @minio
+    Examples: MinIO storage
+    | storage | client encryption         |
+    | minio   | without_client_encryption |
+
+    # skipping s3 because we don't have good enough parallelization yet and this scenario takes too long
+
+    @gcs
+    Examples: Google Cloud Storage
+    | storage        | client encryption         |
+    | google_storage | without_client_encryption |
+
+    @azure
+    Examples: Azure Blob Storage
+    | storage     | client encryption         |
+    | azure_blobs | without_client_encryption |
+
+    @28
+    Scenario Outline: Make a 2 node cluster, backup 1 node, check getting status works
+        Given I have a fresh "2" node ccm cluster with jolokia "<client encryption>" running named "scenario28"
+        Given I am using "<storage>" as storage provider in ccm cluster "<client encryption>" with gRPC server
+        Then the gRPC server is up
+        When I create the "test" table in keyspace "medusa"
+        When I load 100 rows in the "medusa.test" table
+        When I run a "ccm node1 nodetool -- -Dcom.sun.jndi.rmiURLParsing=legacy flush" command
+        When I run a "ccm node2 nodetool -- -Dcom.sun.jndi.rmiURLParsing=legacy flush" command
+        When I perform an async backup over gRPC in "differential" mode of the node named "grpc_backup_28"
+        Then the backup index exists
+        Then I verify over gRPC that the backup "grpc_backup_28" exists and is of type "differential"
+        # The backup status is not actually a SUCCESS because the node2 has not been backed up.
+        # The gRPC server is not meant to understand other nodes.
+        # We just have to check so that we hit the case where a missing node was causing an exception
+        Then I verify over gRPC that the backup "grpc_backup_28" has expected status SUCCESS
+        # now we've checked that, so we can clean up and end
+        Then I delete the backup "grpc_backup_28" over gRPC
+        Then I verify over gRPC that the backup "grpc_backup_28" does not exist
+        Then I verify that backup manager has removed the backup "grpc_backup_28"
+        Then I shutdown the gRPC server
+
+        @local
+        Examples: Local storage
+        | storage                    | client encryption |
+        | local_backup_gc_grace      | without_client_encryption |
+
+    @29
+    Scenario Outline: Backup and restore a DSE cluster with search enabled
+        Given I have a fresh DSE cluster version "6.8.38" with "<client encryption>" running named "scenario29"
+        Given I am using "<storage>" as storage provider in ccm cluster "<client encryption>" with gRPC server
+        Then the gRPC server is up
+        When I create the "test" table in keyspace "medusa"
+        And I create a search index on the "test" table in keyspace "medusa"
+        And I load 100 rows in the "medusa.test" table
+        When I run a DSE "nodetool flush" command
+        Then I can make a search query against the "medusa"."test" table
+        When I perform an async backup over gRPC in "differential" mode of the node named "backup29-1"
+        Then the backup index exists
+        Then I can see the backup named "backup29-1" when I list the backups
+        And the backup "backup29-1" has server_type "dse" in its metadata
+        Then I verify over gRPC that the backup "backup29-1" exists and is of type "differential"
+        Then I verify over gRPC that the backup "backup29-1" has expected status SUCCESS
+        When I perform an async backup over gRPC in "differential" mode of the node named "backup29-2"
+        Then the backup index exists
+        Then I can see the backup named "backup29-2" when I list the backups
+        And the backup "backup29-2" has server_type "dse" in its metadata
+        Then I verify over gRPC that the backup "backup29-2" exists and is of type "differential"
+        Then I verify over gRPC that the backup "backup29-2" has expected status SUCCESS
+        When I restore the backup named "backup29-2"
+        And I wait for the DSE Search indexes to be rebuilt
+        Then I have 100 rows in the "medusa.test" table in ccm cluster "<client encryption>"
+        Then I can make a search query against the "medusa"."test" table
+        Then I stop the DSE cluster
+        And I delete the DSE cluster
+
+    @local
+    Examples: Local storage
+    | storage    | client encryption |
+    | local      | without_client_encryption |
+
+    @s3
+    Examples: S3 storage
+    | storage           | client encryption         |
+    | s3_us_west_oregon | without_client_encryption |
